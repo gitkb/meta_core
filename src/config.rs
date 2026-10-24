@@ -1168,4 +1168,35 @@ mod tests {
         let root = find_root_meta_dir(&grandchild);
         assert_eq!(root, dir.path());
     }
+
+    // ============================================================================
+    // A `.meta/` directory (meta's local folder) is never config
+    // ============================================================================
+
+    #[test]
+    fn test_meta_directory_is_not_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".meta/skills")).unwrap();
+        assert!(find_meta_config_in(dir.path()).is_none());
+
+        std::fs::write(dir.path().join(".meta.yaml"), "projects: {}\n").unwrap();
+        let expected = dir.path().join(".meta.yaml");
+        assert_eq!(find_meta_config_in(dir.path()).unwrap().0, expected);
+        assert_eq!(find_meta_config(dir.path(), None).unwrap().0, expected);
+    }
+
+    #[test]
+    fn test_find_meta_config_walks_past_meta_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir_all(child.join(".meta")).unwrap();
+        // Legacy `.meta` config file in the parent
+        std::fs::write(dir.path().join(".meta"), r#"{"projects": {"child": "x"}}"#).unwrap();
+
+        let (path, _) = find_meta_config(&child, None).unwrap();
+        assert_eq!(path, dir.path().join(".meta"));
+
+        let tree = walk_meta_tree(dir.path(), None).unwrap();
+        assert!(!tree[0].is_meta);
+    }
 }
