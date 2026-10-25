@@ -39,6 +39,15 @@ pub fn escape(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// [`escape`] for multi-line text such as an error message: newlines stay,
+/// every other unsafe character is escaped.
+pub fn escape_lines(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(|c| c != '\n' && is_unsafe_char(c)) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.split('\n').map(escape).collect::<Vec<_>>().join("\n"))
+}
+
 /// [`escape`] for a path, which may also hold bytes that are not UTF-8.
 pub fn escape_path(path: &std::path::Path) -> String {
     escape(&path.to_string_lossy()).into_owned()
@@ -62,5 +71,11 @@ mod tests {
         assert_eq!(escape("n\nfake\r\t"), "n\\nfake\\r\\t");
         assert_eq!(escape("c1\u{9b}31m del\u{7f}"), "c1\\u{9b}31m del\\u{7f}");
         assert_eq!(escape("rtl\u{202e}txt"), "rtl\\u{202e}txt");
+    }
+
+    #[test]
+    fn escape_lines_keeps_newlines_only() {
+        assert!(matches!(escape_lines("a\nb"), Cow::Borrowed(_)));
+        assert_eq!(escape_lines("a\u{1b}[2J\nb\r"), "a\\u{1b}[2J\nb\\r");
     }
 }

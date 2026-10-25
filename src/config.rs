@@ -162,6 +162,10 @@ pub fn find_meta_config(
 }
 
 /// Parse a meta config file (JSON or YAML) and return normalized project info and ignore list.
+///
+/// Every project is checked by [`validate_project`] and no two projects may
+/// share or nest paths ([`check_no_overlap`]); a bad entry fails the parse
+/// with the file and project named.
 pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, Vec<String>)> {
     let config_str = std::fs::read_to_string(meta_path)
         .with_context(|| format!("Failed to read meta config file: '{}'", meta_path.display()))?;
@@ -178,7 +182,10 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 
     // Convert project entries to normalized, validated ProjectInfo
     // in name order, so the first bad entry reported is always the same one
-    let base_dir = meta_path.parent().unwrap_or(Path::new("."));
+    let base_dir = meta_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let mut entries: Vec<_> = config.projects.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let projects: Vec<ProjectInfo> = entries
@@ -222,6 +229,8 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
             Ok(info)
         })
         .collect::<anyhow::Result<_>>()?;
+    check_no_overlap(&projects)
+        .map_err(|e| anyhow::anyhow!("Invalid projects in {}: {e}", escape_path(meta_path)))?;
 
     Ok((projects, config.ignore))
 }
@@ -232,7 +241,8 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 /// join `path` onto the directory of the `.meta` file without checking again:
 /// - No value (name, path, repo, tags, provides, depends_on) is empty or holds
 ///   a control or bidirectional-control character ([`is_unsafe_char`]).
-/// - `name` is one path component: not `.` or `..`, no `/` or `\`.
+/// - `name` is one path component: not `.` or `..`, no `/`, `\` or drive
+///   prefix.
 /// - `path` (the name when omitted) is relative and stays inside the config's
 ///   directory: `\` reads as `/`, empty and `.` components are dropped, `..`
 ///   and drive prefixes (`C:`) are rejected, something must remain, and no
@@ -264,8 +274,13 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<(), Strin
             ));
         }
     }
-    if matches!(info.name.as_str(), "." | "..") || info.name.contains(['/', '\\']) {
-        return Err("name must be a single path component (no '/', '\\', '.' or '..')".into());
+    if matches!(info.name.as_str(), "." | "..")
+        || info.name.contains(['/', '\\'])
+        || starts_with_drive(&info.name)
+    {
+        return Err(
+            "name must be a single path component (no '/', '\\', drive prefix, '.' or '..')".into(),
+        );
     }
     if info.repo.as_deref().is_some_and(|r| r.starts_with('-')) {
         return Err("repo must not start with '-'".into());
@@ -281,14 +296,50 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<(), Strin
     check_no_symlink_escape(base_dir, &info.path)
 }
 
+/// Refuse two projects at one path, or one project inside another's
+/// directory: a clone of the outer repo could create a symlink that the
+/// inner path then follows out of the workspace. A repo inside another
+/// belongs in a nested `.meta` (`meta: true`).
+fn check_no_overlap(projects: &[ProjectInfo]) -> Result<(), String> {
+    let mut by_path = HashMap::new();
+    for p in projects {
+        if let Some(other) = by_path.insert(p.path.as_str(), p.name.as_str()) {
+            return Err(format!(
+                "Projects '{}' and '{}' have the same path '{}'",
+                escape(other),
+                escape(&p.name),
+                escape(&p.path)
+            ));
+        }
+    }
+    for p in projects {
+        for (i, _) in p.path.match_indices('/') {
+            let outer = p.path.get(..i).and_then(|prefix| by_path.get(prefix));
+            if let Some(outer) = outer {
+                return Err(format!(
+                    "Project '{}' (path '{}') is inside project '{}'; list it in a nested .meta instead",
+                    escape(&p.name),
+                    escape(&p.path),
+                    escape(outer)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True for a `C:` prefix, which makes a Windows path absolute or
+/// drive-relative wherever it appears.
+fn starts_with_drive(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
+}
+
 /// Normalize a project path to `a/b` form, rejecting anything that is not a
 /// plain relative path below the config's directory.
 fn normalize_project_path(raw: &str) -> Result<String, String> {
     let unified = raw.replace('\\', "/");
-    let mut chars = unified.chars();
-    let drive =
-        matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic());
-    if unified.starts_with('/') || drive || Path::new(raw).is_absolute() {
+    if unified.starts_with('/') {
         return Err(format!("path '{raw}' must be relative"));
     }
     let mut parts = Vec::new();
@@ -296,6 +347,9 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
         match part {
             "" | "." => {}
             ".." => return Err(format!("path '{raw}' must not contain '..'")),
+            part if starts_with_drive(part) => {
+                return Err(format!("path '{raw}' must be relative (no drive prefix)"))
+            }
             part => parts.push(part),
         }
     }
@@ -310,9 +364,9 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
 /// Refuse a path that reaches outside `base_dir` through a symlink that
 /// already exists (in the workspace or in a checked-out repo).
 fn check_no_symlink_escape(base_dir: &Path, rel: &str) -> Result<(), String> {
-    let Ok(base) = base_dir.canonicalize() else {
-        return Ok(()); // nothing on disk yet, so nothing to follow
-    };
+    let base = base_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", escape_path(base_dir)))?;
     let mut current = base.clone();
     for part in rel.split('/') {
         current.push(part);
@@ -1235,6 +1289,43 @@ mod tests {
             // The offending value is escaped in the message itself
             assert!(!err.contains('\u{1b}'), "{json}: {err}");
         }
+    }
+
+    #[test]
+    fn test_parse_rejects_drive_prefixes_anywhere() {
+        for json in [
+            r#"{"projects": {"p": {"repo": "u", "path": "./C:/outside"}}}"#,
+            r#"{"projects": {"p": {"repo": "u", "path": "a/C:b"}}}"#,
+            r#"{"projects": {"C:outside": {"repo": "u", "path": "safe"}}}"#,
+        ] {
+            let err = parse_err(json);
+            assert!(err.contains("drive prefix"), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_overlapping_paths() {
+        let err = parse_err(
+            r#"{"projects": {"outer": {"repo": "u", "path": "a"}, "inner": {"repo": "u", "path": "a/link/x"}}}"#,
+        );
+        assert!(
+            err.contains("Project 'inner' (path 'a/link/x') is inside project 'outer'"),
+            "{err}"
+        );
+
+        let err = parse_err(
+            r#"{"projects": {"one": {"repo": "u", "path": "x"}, "two": {"repo": "u", "path": "./x/"}}}"#,
+        );
+        assert!(err.contains("have the same path 'x'"), "{err}");
+
+        // A shared name prefix is not nesting
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"a": "u", "a-b": "u", "ab": {"repo": "u", "path": "a.b/c"}}}"#,
+        )
+        .unwrap();
+        assert!(parse_meta_config(&dir.path().join(".meta")).is_ok());
     }
 
     #[test]

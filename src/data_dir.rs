@@ -21,12 +21,22 @@ pub fn ensure_meta_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The meta data directory, checked with [`check_private_dir`] when it exists,
+/// so nothing is read from one that another user could have written to.
+pub fn private_meta_dir() -> Result<PathBuf> {
+    let dir = crate::meta_dir()?;
+    if dir.exists() {
+        check_private_dir(&dir)?;
+    }
+    Ok(dir)
+}
+
 /// Get the path for a namespaced data file: `~/.meta/<namespace>.json`.
 ///
 /// The file may or may not exist. Use `store::read` to read with a default,
 /// or check existence manually.
 pub fn data_file(namespace: &str) -> Result<PathBuf> {
-    Ok(crate::meta_dir()?.join(format!("{namespace}.json")))
+    Ok(private_meta_dir()?.join(format!("{namespace}.json")))
 }
 
 /// Get the path for a namespaced subdirectory: `~/.meta/<namespace>/`.
