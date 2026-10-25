@@ -345,9 +345,12 @@ fn validate_project(
         return Err(format!("tag '{tag}' contains whitespace or ','"));
     }
     info.path = normalize_project_path(&info.path)?;
+    // The configured worktree directory, and the default one always
     let in_worktrees = |value: &str| {
-        let (value, worktrees) = (value.to_ascii_lowercase(), worktrees.to_ascii_lowercase());
-        value == worktrees || value.starts_with(&format!("{worktrees}/"))
+        let value = value.to_ascii_lowercase();
+        [worktrees.to_ascii_lowercase(), ".worktrees".to_string()]
+            .iter()
+            .any(|dir| value == *dir || value.starts_with(&format!("{dir}/")))
     };
     for value in [&info.name, &info.path] {
         if in_worktrees(value) {
@@ -1640,6 +1643,10 @@ mod tests {
             ),
             (
                 r#"{"projects": {"p": {"repo": "u", "path": "sets/x"}}, "worktrees_dir": "sets"}"#,
+                "inside sets",
+            ),
+            (
+                r#"{"projects": {".worktrees/b": {"repo": "u", "path": "b"}}, "worktrees_dir": "sets"}"#,
                 "inside sets",
             ),
             (r#"{"projects": {"x|y": "u"}}"#, "ASCII letters"),
