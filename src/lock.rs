@@ -11,6 +11,7 @@
 //! be writable by group or others; anyone else who could write there could
 //! replace the lock file or the store beside it.
 
+use crate::display::escape_path;
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
@@ -37,7 +38,7 @@ impl LockGuard {
 pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create lock directory: {}", parent.display()))?;
+            .with_context(|| format!("Failed to create lock directory: {}", escape_path(parent)))?;
         crate::data_dir::check_private_dir(parent)?;
     }
     let file = OpenOptions::new()
@@ -46,7 +47,7 @@ pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
         .create(true)
         .truncate(false)
         .open(lock_path)
-        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
+        .with_context(|| format!("Failed to open lock file: {}", escape_path(lock_path)))?;
 
     let deadline = Instant::now() + timeout;
     loop {
@@ -63,10 +64,10 @@ pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
             Err(TryLockError::WouldBlock) => anyhow::bail!(
                 "Timed out after {:?} waiting for the lock at {}: another meta process holds it",
                 timeout,
-                lock_path.display()
+                escape_path(lock_path)
             ),
             Err(TryLockError::Error(e)) => {
-                return Err(e).with_context(|| format!("Failed to lock {}", lock_path.display()))
+                return Err(e).with_context(|| format!("Failed to lock {}", escape_path(lock_path)))
             }
         }
     }

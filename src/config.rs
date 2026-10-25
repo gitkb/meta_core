@@ -188,7 +188,7 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
         .unwrap_or(Path::new("."));
     let mut entries: Vec<_> = config.projects.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let projects: Vec<ProjectInfo> = entries
+    let checked: Vec<(ProjectInfo, PathBuf)> = entries
         .into_iter()
         .map(|(name, entry)| {
             let (repo, path, tags, provides, depends_on, meta) = match entry {
@@ -219,18 +219,19 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
                 depends_on,
                 meta,
             };
-            validate_project(base_dir, &mut info).map_err(|reason| {
+            let location = validate_project(base_dir, &mut info).map_err(|reason| {
                 anyhow::anyhow!(
                     "Invalid project '{}' in {}: {reason}",
                     escape(&info.name),
                     escape_path(meta_path)
                 )
             })?;
-            Ok(info)
+            Ok((info, location))
         })
         .collect::<anyhow::Result<_>>()?;
-    check_no_overlap(&projects)
+    check_no_overlap(&checked)
         .map_err(|e| anyhow::anyhow!("Invalid projects in {}: {e}", escape_path(meta_path)))?;
+    let projects = checked.into_iter().map(|(info, _)| info).collect();
 
     Ok((projects, config.ignore))
 }
@@ -249,7 +250,9 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 ///   symlink along it may lead outside the directory.
 /// - `repo` does not start with `-`, so git cannot read it as an option.
 /// - Tags hold no whitespace and no `,`, which the `--tag` filter splits on.
-fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<(), String> {
+///
+/// Returns where the project lives on disk (see [`resolve_inside`]).
+fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, String> {
     let lists = [
         ("tag", &info.tags),
         ("provides entry", &info.provides),
@@ -293,36 +296,41 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<(), Strin
         return Err(format!("tag '{tag}' contains whitespace or ','"));
     }
     info.path = normalize_project_path(&info.path)?;
-    check_no_symlink_escape(base_dir, &info.path)
+    resolve_inside(base_dir, &info.path)
 }
 
-/// Refuse two projects at one path, or one project inside another's
-/// directory: a clone of the outer repo could create a symlink that the
-/// inner path then follows out of the workspace. A repo inside another
-/// belongs in a nested `.meta` (`meta: true`).
-fn check_no_overlap(projects: &[ProjectInfo]) -> Result<(), String> {
-    let mut by_path = HashMap::new();
-    for p in projects {
-        if let Some(other) = by_path.insert(p.path.as_str(), p.name.as_str()) {
+/// Refuse two projects at one location, or one inside another's directory:
+/// a clone of the outer repo could check out a symlink that the inner path
+/// then follows out of the workspace. Locations are compared as resolved
+/// through existing symlinks, and without case, which some filesystems
+/// ignore. A repo inside another belongs in a nested `.meta` (`meta: true`).
+fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
+    let keyed: Vec<_> = projects
+        .iter()
+        .map(|(info, location)| {
+            (
+                PathBuf::from(location.to_string_lossy().to_lowercase()),
+                info,
+            )
+        })
+        .collect();
+    for (i, (outer_key, outer)) in keyed.iter().enumerate() {
+        for (inner_key, inner) in keyed.iter().skip(i + 1) {
+            let (outer, inner) = if inner_key.starts_with(outer_key) {
+                (outer, inner)
+            } else if outer_key.starts_with(inner_key) {
+                (inner, outer)
+            } else {
+                continue;
+            };
             return Err(format!(
-                "Projects '{}' and '{}' have the same path '{}'",
-                escape(other),
-                escape(&p.name),
-                escape(&p.path)
+                "project '{}' (path '{}') is at or inside project '{}' (path '{}'); \
+                 list it in a nested .meta instead",
+                escape(&inner.name),
+                escape(&inner.path),
+                escape(&outer.name),
+                escape(&outer.path)
             ));
-        }
-    }
-    for p in projects {
-        for (i, _) in p.path.match_indices('/') {
-            let outer = p.path.get(..i).and_then(|prefix| by_path.get(prefix));
-            if let Some(outer) = outer {
-                return Err(format!(
-                    "Project '{}' (path '{}') is inside project '{}'; list it in a nested .meta instead",
-                    escape(&p.name),
-                    escape(&p.path),
-                    escape(outer)
-                ));
-            }
         }
     }
     Ok(())
@@ -361,21 +369,25 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
-/// Refuse a path that reaches outside `base_dir` through a symlink that
-/// already exists (in the workspace or in a checked-out repo).
-fn check_no_symlink_escape(base_dir: &Path, rel: &str) -> Result<(), String> {
+/// Resolve `rel` below `base_dir` through the symlinks that exist now, and
+/// refuse it if one leads outside `base_dir` or if it is `base_dir` itself.
+/// Returns the project's location: the real path of the part that exists,
+/// followed by the part not created yet.
+fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let base = base_dir
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", escape_path(base_dir)))?;
     let mut current = base.clone();
+    let mut exists = true;
     for part in rel.split('/') {
         current.push(part);
-        let Ok(meta) = current.symlink_metadata() else {
-            return Ok(()); // the rest does not exist yet
-        };
-        if meta.file_type().is_symlink() {
-            match current.canonicalize() {
-                Ok(target) if target.starts_with(&base) => current = target,
+        if !exists {
+            continue;
+        }
+        match current.symlink_metadata() {
+            Err(_) => exists = false,
+            Ok(meta) if meta.file_type().is_symlink() => match current.canonicalize() {
+                Ok(target) if target.starts_with(&base) && target != base => current = target,
                 _ => {
                     return Err(format!(
                         "path '{rel}' leads outside {} through the symlink '{}'",
@@ -383,10 +395,11 @@ fn check_no_symlink_escape(base_dir: &Path, rel: &str) -> Result<(), String> {
                         escape_path(&current)
                     ))
                 }
-            }
+            },
+            Ok(_) => {}
         }
     }
-    Ok(())
+    Ok(current)
 }
 
 /// Load defaults from a meta config file.
@@ -725,17 +738,14 @@ mod tests {
     }
 
     #[test]
-    fn test_walk_meta_tree_cycle_detection() {
+    fn test_walk_meta_tree_rejects_symlink_cycles() {
+        // A nested project that links back to its own meta dir (or any
+        // ancestor) is refused, so the walk cannot loop
         let dir = tempfile::tempdir().unwrap();
         let child = dir.path().join("child");
         std::fs::create_dir(&child).unwrap();
-
-        // Create a symlink from child/loop back to child itself (a link to an
-        // ancestor would leave child's directory and be rejected outright)
         #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&child, child.join("loop")).unwrap();
-        }
+        std::os::unix::fs::symlink(&child, child.join("loop")).unwrap();
 
         std::fs::write(
             dir.path().join(".meta"),
@@ -748,14 +758,11 @@ mod tests {
         )
         .unwrap();
 
-        // Should not infinite loop - cycle detection stops recursion
-        let tree = walk_meta_tree(dir.path(), None).unwrap();
-        let paths = flatten_meta_tree(&tree);
-        assert!(paths.contains(&"child".to_string()));
-        // The cycle node is included but has no children
-        assert!(paths.contains(&"child/loop".to_string()));
-        let child_node = &tree[0];
-        assert!(child_node.children[0].children.is_empty());
+        #[cfg(unix)]
+        {
+            let err = walk_meta_tree(dir.path(), None).unwrap_err().to_string();
+            assert!(err.contains("through the symlink"), "{err}");
+        }
     }
 
     #[test]
@@ -1291,6 +1298,30 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_overlap_through_symlink_alias() {
+        // `alias` points at `real`, so `alias/outer/link/x` sits inside
+        // `real/outer`, whose clone could plant `link` pointing anywhere.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("alias")).unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"outer": {"repo": "u", "path": "real/outer"}, "inner": {"repo": "u", "path": "alias/outer/link/x"}}}"#,
+        )
+        .unwrap();
+        let err = parse_meta_config(&dir.path().join(".meta"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "project 'inner' (path 'alias/outer/link/x') is at or inside project 'outer'"
+            ),
+            "{err}"
+        );
+    }
+
     #[test]
     fn test_parse_rejects_drive_prefixes_anywhere() {
         for json in [
@@ -1309,14 +1340,23 @@ mod tests {
             r#"{"projects": {"outer": {"repo": "u", "path": "a"}, "inner": {"repo": "u", "path": "a/link/x"}}}"#,
         );
         assert!(
-            err.contains("Project 'inner' (path 'a/link/x') is inside project 'outer'"),
+            err.contains("project 'inner' (path 'a/link/x') is at or inside project 'outer'"),
             "{err}"
         );
 
         let err = parse_err(
             r#"{"projects": {"one": {"repo": "u", "path": "x"}, "two": {"repo": "u", "path": "./x/"}}}"#,
         );
-        assert!(err.contains("have the same path 'x'"), "{err}");
+        assert!(
+            err.contains("project 'two' (path 'x') is at or inside project 'one'"),
+            "{err}"
+        );
+
+        // Case differences don't separate paths (some filesystems ignore case)
+        let err = parse_err(
+            r#"{"projects": {"one": {"repo": "u", "path": "Lib"}, "two": {"repo": "u", "path": "lib/x"}}}"#,
+        );
+        assert!(err.contains("is at or inside project 'one'"), "{err}");
 
         // A shared name prefix is not nesting
         let dir = tempfile::tempdir().unwrap();
