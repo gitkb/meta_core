@@ -256,6 +256,19 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
         .collect::<anyhow::Result<_>>()?;
     check_no_overlap(&checked)
         .map_err(|e| anyhow::anyhow!("Invalid projects in {}: {e}", escape_path(meta_path)))?;
+    // Nor may the worktree directory sit inside a project's checkout
+    if let Some(at) = &worktrees_at {
+        for (info, location) in &checked {
+            if at.starts_with(PathBuf::from(location.to_string_lossy().to_lowercase())) {
+                anyhow::bail!(
+                    "Invalid worktrees_dir in {}: '{}' is inside project '{}'",
+                    escape_path(meta_path),
+                    escape(&worktrees),
+                    escape(&info.name)
+                );
+            }
+        }
+    }
     let projects = checked.into_iter().map(|(info, _)| info).collect();
 
     Ok((projects, config.ignore))
@@ -1731,6 +1744,10 @@ mod tests {
             r#"{"projects": {"API": {"repo": "u", "path": "x"}, "api": {"repo": "u", "path": "y"}}}"#,
         );
         assert!(err.contains("is the same as or inside"), "{err}");
+        let err = parse_err(
+            r#"{"projects": {"app": {"repo": "u", "path": "app"}}, "worktrees_dir": "app/wt"}"#,
+        );
+        assert!(err.contains("is inside project 'app'"), "{err}");
         let err = parse_err(r#"{"projects": {}, "worktrees_dir": "../out"}"#);
         assert!(err.contains("Invalid worktrees_dir"), "{err}");
     }
