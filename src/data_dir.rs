@@ -68,6 +68,8 @@ pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
 /// the final file must pass [`check_private_dir`], each link must belong to
 /// you or root, and the file itself must belong to you or root and be
 /// writable by no one else.
+// Off Unix links are refused, so the walk below never follows one
+#[cfg_attr(not(unix), allow(unused_mut, clippy::never_loop))]
 pub fn check_trusted_file(path: &Path) -> Result<()> {
     let shown = crate::display::escape_path(path);
     let mut current =
@@ -81,6 +83,13 @@ pub fn check_trusted_file(path: &Path) -> Result<()> {
         let meta = std::fs::symlink_metadata(&current)
             .with_context(|| format!("Failed to stat {shown}"))?;
         if meta.file_type().is_symlink() {
+            // On Windows the link's own access list is not checked here, so
+            // a link is refused, as in check_private_dir
+            #[cfg(not(unix))]
+            anyhow::bail!(
+                "Refusing to use {shown}: {} is a link; use the real file",
+                crate::display::escape_path(&current)
+            );
             #[cfg(unix)]
             {
                 // SAFETY: geteuid has no preconditions and cannot fail.
@@ -91,11 +100,11 @@ pub fn check_trusted_file(path: &Path) -> Result<()> {
                         crate::display::escape_path(&current)
                     );
                 }
+                let target = std::fs::read_link(&current)
+                    .with_context(|| format!("Failed to read the symlink {shown}"))?;
+                current = parent.join(target);
+                continue;
             }
-            let target = std::fs::read_link(&current)
-                .with_context(|| format!("Failed to read the symlink {shown}"))?;
-            current = parent.join(target);
-            continue;
         }
         #[cfg(unix)]
         {
