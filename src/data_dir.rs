@@ -62,6 +62,43 @@ pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
     check_private_dir(dir)
 }
 
+/// Refuse a file that meta will run, such as a plugin, if another user could
+/// change or replace it: the directory it really lives in (after symlinks)
+/// must pass [`check_private_dir`], and the file itself must belong to you
+/// or root and be writable by no one else.
+pub fn check_trusted_file(path: &Path) -> Result<()> {
+    let shown = crate::display::escape_path(path);
+    let real = path
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve {shown}"))?;
+    if let Some(parent) = real.parent() {
+        check_private_dir(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&real).with_context(|| format!("Failed to stat {shown}"))?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        if !owned_by_you_or_root(&meta, uid) || meta.mode() & 0o022 != 0 || acl_allows_others(&real)
+        {
+            anyhow::bail!(
+                "Refusing to use {shown}: another user owns it or can change it \
+                 (fix with: chmod go-w '{shown}')"
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        use crate::win_acl::{current_user_sid, untrusted_access, DIR_RIGHTS};
+        let user = current_user_sid()?;
+        if let Some(why) = untrusted_access(&real, &user, DIR_RIGHTS, "change")? {
+            anyhow::bail!("Refusing to use {shown}: {why}");
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a directory that another user owns or can write to: they could
 /// replace the stores, locks or plugins in it.
 ///
@@ -198,7 +235,7 @@ fn only_you_can_write(meta: &std::fs::Metadata, sticky_ok: bool) -> bool {
 /// an ACL cannot grant more than the group bits allow, so the mode check
 /// covers it.
 #[cfg(target_os = "macos")]
-fn acl_allows_others(path: &Path) -> bool {
+pub(crate) fn acl_allows_others(path: &Path) -> bool {
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::os::unix::ffi::OsStrExt;
 
@@ -240,7 +277,7 @@ fn acl_allows_others(path: &Path) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn acl_allows_others(_path: &Path) -> bool {
+pub(crate) fn acl_allows_others(_path: &Path) -> bool {
     false
 }
 
@@ -437,6 +474,25 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(err.contains("could hold the lock"), "{err}");
+
+        // A grant that applies only to files in a private-looking directory
+        // still reaches a store file created there
+        let files_only = tmp.path().join("files-only");
+        std::fs::create_dir(&files_only).unwrap();
+        check_private_dir(&files_only).unwrap();
+        let granted = std::process::Command::new("icacls")
+            .arg(&files_only)
+            .args(["/grant", "*S-1-1-0:(OI)(IO)M"])
+            .status()
+            .unwrap();
+        assert!(granted.success());
+        let store = files_only.join("store.json");
+        crate::store::write_atomic(&store, &std::collections::HashMap::<String, String>::new())
+            .unwrap();
+        let err = crate::store::read::<std::collections::HashMap<String, String>>(&store)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("S-1-1-0 may change it"), "{err}");
     }
 
     #[cfg(target_os = "macos")]
@@ -454,6 +510,45 @@ mod tests {
         assert!(added.success());
         let err = check_private_dir(&dir).unwrap_err().to_string();
         assert!(err.contains("access control list"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_refuses_a_store_file_acl_that_allows_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store.json");
+        crate::store::write_atomic(&store, &std::collections::HashMap::<String, String>::new())
+            .unwrap();
+        let added = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow write"])
+            .arg(&store)
+            .status()
+            .unwrap();
+        assert!(added.success());
+        assert!(crate::store::read::<std::collections::HashMap<String, String>>(&store).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_trusted_file_refuses_a_plugin_others_can_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("meta-x");
+        std::fs::write(&plugin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        check_trusted_file(&plugin).unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o757)).unwrap();
+        assert!(check_trusted_file(&plugin).is_err());
+
+        // A symlink to a plugin in a directory others can write is refused too
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&plugin, shared.join("meta-x")).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(shared.join("meta-x"), &plugin).unwrap();
+        assert!(check_trusted_file(&plugin).is_err());
     }
 
     #[cfg(unix)]

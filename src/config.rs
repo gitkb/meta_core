@@ -308,7 +308,28 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, 
         return Err(format!("tag '{tag}' contains whitespace or ','"));
     }
     info.path = normalize_project_path(&info.path)?;
-    resolve_inside(base_dir, &info.path)
+    let location = resolve_inside(base_dir, &info.path)?;
+    // Where it really goes must not be reserved either (`alias -> .git`)
+    let base = base_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", escape_path(base_dir)))?;
+    if let Ok(inside) = location.strip_prefix(&base) {
+        let parts: Vec<String> = inside
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if parts.iter().any(|p| p.eq_ignore_ascii_case(".git"))
+            || parts
+                .first()
+                .is_some_and(|p| p.eq_ignore_ascii_case(".worktrees"))
+        {
+            return Err(format!(
+                "path '{}' leads into .git or .worktrees through a symlink",
+                info.path
+            ));
+        }
+    }
+    Ok(location)
 }
 
 /// Refuse two projects at one location, or one inside another's directory:
@@ -1294,6 +1315,13 @@ mod tests {
         assert!(err.contains("vendor"), "{err}");
     }
 
+    fn parse_err_in(dir: &Path, json: &str) -> String {
+        std::fs::write(dir.join(".meta"), json).unwrap();
+        parse_meta_config(&dir.join(".meta"))
+            .unwrap_err()
+            .to_string()
+    }
+
     fn parse_err(json: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".meta"), json).unwrap();
@@ -1388,6 +1416,19 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_reserved_dirs_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join(".git"), dir.path().join("alias")).unwrap();
+        let err = parse_err_in(
+            dir.path(),
+            r#"{"projects": {"p": {"repo": "u", "path": "alias/hooks"}}}"#,
+        );
+        assert!(err.contains("leads into .git or .worktrees"), "{err}");
     }
 
     #[cfg(unix)]

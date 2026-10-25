@@ -80,7 +80,11 @@ pub fn check_private_file(path: &Path) -> Result<()> {
         .with_context(|| format!("Failed to stat {}", escape_path(path)))?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    if !meta.is_file() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+    if !meta.is_file()
+        || meta.uid() != uid
+        || meta.mode() & 0o022 != 0
+        || crate::data_dir::acl_allows_others(path)
+    {
         anyhow::bail!(
             "Refusing to read {}: it must be a regular file owned by you that no one else can \
              write (fix with: chmod go-w, or remove it)",
@@ -90,9 +94,27 @@ pub fn check_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// On Windows the directory's access list (checked by `data_dir`) is what
-/// the files in it inherit; a symlink is still refused.
-#[cfg(not(unix))]
+/// On Windows: a regular file that no account but you and the system's own
+/// owns or may change (whether by its own entries or inherited ones).
+#[cfg(windows)]
+pub fn check_private_file(path: &Path) -> Result<()> {
+    use crate::win_acl::{current_user_sid, untrusted_access, DIR_RIGHTS};
+
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to stat {}", escape_path(path)))?;
+    if !meta.is_file() {
+        anyhow::bail!(
+            "Refusing to read {}: it is not a regular file",
+            escape_path(path)
+        );
+    }
+    if let Some(why) = untrusted_access(path, &current_user_sid()?, DIR_RIGHTS, "change")? {
+        anyhow::bail!("Refusing to read {}: {why}", escape_path(path));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn check_private_file(path: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("Failed to stat {}", escape_path(path)))?;

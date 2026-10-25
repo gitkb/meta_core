@@ -39,20 +39,6 @@ impl LockGuard {
 pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
     if let Some(parent) = lock_path.parent() {
         crate::data_dir::create_private_dir(parent)?;
-        // Anyone who can open the lock file can hold the lock; on Unix the
-        // file is made 0600 below, on Windows it inherits the directory's
-        // access list
-        #[cfg(windows)]
-        {
-            use crate::win_acl::{current_user_sid, untrusted_access, READ_RIGHTS};
-            let user = current_user_sid()?;
-            if let Some(why) = untrusted_access(parent, &user, READ_RIGHTS, "open files in")? {
-                anyhow::bail!(
-                    "Refusing to lock in {}: {why}, so another account could hold the lock",
-                    escape_path(parent)
-                );
-            }
-        }
     }
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -75,6 +61,26 @@ pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
         if mode & 0o077 != 0 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("Failed to restrict {}", escape_path(lock_path)))?;
+        }
+    }
+    // An access list can still let others open it: refuse, rather than
+    // wait on a lock someone else may hold forever
+    #[cfg(target_os = "macos")]
+    if crate::data_dir::acl_allows_others(lock_path) {
+        anyhow::bail!(
+            "Refusing to lock {}: its access control list lets others open it \
+             (remove with: chmod -N)",
+            escape_path(lock_path)
+        );
+    }
+    #[cfg(windows)]
+    {
+        use crate::win_acl::{current_user_sid, untrusted_access, READ_RIGHTS};
+        if let Some(why) = untrusted_access(lock_path, &current_user_sid()?, READ_RIGHTS, "open")? {
+            anyhow::bail!(
+                "Refusing to lock {}: {why}, so another account could hold the lock",
+                escape_path(lock_path)
+            );
         }
     }
 
