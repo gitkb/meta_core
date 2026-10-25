@@ -115,7 +115,7 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
         // leaving a directory through `..` depends on it as much as entering
         // one of its entries does
         let holder = stat(&current)?;
-        if !owned_by_you_or_root(&holder, uid) || !only_you_can_write(&holder, uid, true) {
+        if !owned_by_you_or_root(&holder, uid) || !only_you_can_write(&holder, true) {
             anyhow::bail!(
                 "Refusing to use {shown}: another user could replace it through {} \
                  (it must belong to you or root and not be writable by others){}",
@@ -158,7 +158,7 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
             outside_namespace_note(&meta)
         );
     }
-    if !only_you_can_write(&meta, uid, false) {
+    if !only_you_can_write(&meta, false) {
         anyhow::bail!(
             "Refusing to use {shown}: other users can write to it (fix with: chmod go-w '{shown}')"
         );
@@ -172,59 +172,15 @@ fn owned_by_you_or_root(meta: &std::fs::Metadata, uid: u32) -> bool {
     meta.uid() == uid || meta.uid() == 0
 }
 
-/// No one but you (and root) can change the entries of this directory: it is
-/// not writable by others, or only for its group when that group is your own
-/// private group, or (when `sticky_ok`) it is sticky, so only an entry's
-/// owner can rename that entry.
+/// No one but you (and root) can change the entries of this directory: it
+/// is writable by no one else, or (when `sticky_ok`) it is sticky, so only an
+/// entry's owner can rename that entry. Group write is refused even for your
+/// own private group: ACLs and other accounts with that primary group can
+/// widen it in ways the mode bits do not show.
 #[cfg(unix)]
-fn only_you_can_write(meta: &std::fs::Metadata, uid: u32, sticky_ok: bool) -> bool {
+fn only_you_can_write(meta: &std::fs::Metadata, sticky_ok: bool) -> bool {
     use std::os::unix::fs::MetadataExt;
-    if sticky_ok && meta.mode() & 0o1000 != 0 {
-        return true;
-    }
-    meta.mode() & 0o002 == 0 && (meta.mode() & 0o020 == 0 || is_private_group(meta.gid(), uid))
-}
-
-/// Whether `gid` is the user's own private group, as on systems that give
-/// every user a group of their own (and umask 002): the user's primary
-/// group, named after the user, with no other members.
-#[cfg(unix)]
-fn is_private_group(gid: u32, uid: u32) -> bool {
-    use std::ffi::CStr;
-    use std::ptr::null_mut;
-
-    // SAFETY: the reentrant lookups write only into the structs and buffers
-    // passed in, and the strings read here point into those buffers.
-    unsafe {
-        let mut pwd: libc::passwd = std::mem::zeroed();
-        let mut found: *mut libc::passwd = null_mut();
-        let mut pw_buf = vec![0 as libc::c_char; 16 * 1024];
-        if libc::getpwuid_r(uid, &mut pwd, pw_buf.as_mut_ptr(), pw_buf.len(), &mut found) != 0
-            || found.is_null()
-            || pwd.pw_gid != gid
-        {
-            return false;
-        }
-        let user = CStr::from_ptr(pwd.pw_name);
-
-        let mut grp: libc::group = std::mem::zeroed();
-        let mut found: *mut libc::group = null_mut();
-        let mut gr_buf = vec![0 as libc::c_char; 64 * 1024];
-        if libc::getgrgid_r(gid, &mut grp, gr_buf.as_mut_ptr(), gr_buf.len(), &mut found) != 0
-            || found.is_null()
-            || CStr::from_ptr(grp.gr_name) != user
-        {
-            return false;
-        }
-        let mut member = grp.gr_mem;
-        while !member.is_null() && !(*member).is_null() {
-            if CStr::from_ptr(*member) != user {
-                return false;
-            }
-            member = member.add(1);
-        }
-        true
-    }
+    meta.mode() & 0o022 == 0 || (sticky_ok && meta.mode() & 0o1000 != 0)
 }
 
 /// In a user namespace that maps only you (some sandboxes), files of every
@@ -401,26 +357,6 @@ mod tests {
         check_private_dir(&private).unwrap();
         let err = check_private_dir(&junction).unwrap_err().to_string();
         assert!(err.contains("is a link or junction"), "{err}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_group_write_is_fine_only_for_your_private_group() {
-        use std::os::unix::fs::PermissionsExt;
-
-        // A 0775 directory gets your primary group; whether that group is
-        // private to you depends on the machine, and decides the outcome
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("ws");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
-        // SAFETY: no preconditions
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        let gid_of_dir = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&dir).unwrap());
-        let private = gid_of_dir == gid && is_private_group(gid, uid);
-        assert_eq!(check_private_dir(&dir).is_ok(), private);
-        // A group that is not yours never counts
-        assert!(!is_private_group(gid.wrapping_add(1), uid));
     }
 
     #[cfg(unix)]

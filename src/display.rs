@@ -12,9 +12,10 @@ use std::fmt::Write;
 
 /// True for characters that must never reach a terminal raw: C0 and C1
 /// controls and DEL; the Unicode bidirectional controls, which reorder how a
-/// line is displayed (U+061C, U+200E-F, U+202A-E, U+2066-9); and invisible
-/// format characters that hide text from a reader (soft hyphen, zero-width
-/// characters, word joiners, BOM, tag characters).
+/// line is displayed (U+061C, U+200E-F, U+202A-E, U+2066-9); the line and
+/// paragraph separators (U+2028-9), which many renderers treat as line
+/// breaks; and invisible format characters that hide text from a reader
+/// (soft hyphen, zero-width characters, word joiners, BOM, tag characters).
 pub fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
@@ -22,7 +23,7 @@ pub fn is_unsafe_char(c: char) -> bool {
             '\u{AD}'
                 | '\u{061C}'
                 | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
+                | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2069}'
                 | '\u{FEFF}'
                 | '\u{E0000}'..='\u{E007F}'
@@ -83,6 +84,7 @@ mod tests {
         assert_eq!(escape("c1\u{9b}31m del\u{7f}"), "c1\\u{9b}31m del\\u{7f}");
         assert_eq!(escape("rtl\u{202e}txt"), "rtl\\u{202e}txt");
         assert_eq!(escape("alm\u{61c}x"), "alm\\u{61c}x");
+        assert_eq!(escape("a\u{2028}## b"), "a\\u{2028}## b");
         assert_eq!(
             escape("zw\u{200b}j\u{2060}t\u{e0041}"),
             "zw\\u{200b}j\\u{2060}t\\u{e0041}"
