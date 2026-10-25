@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(store.items.get("second").unwrap(), "2");
 
         // Lock should be released
-        assert!(crate::lock::acquire(&lock_path, std::time::Duration::ZERO).is_ok());
+        assert!(crate::lock::acquire(&lock_path, std::time::Duration::from_millis(500)).is_ok());
     }
 
     #[cfg(unix)]

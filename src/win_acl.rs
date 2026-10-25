@@ -19,7 +19,9 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 5;
 const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 11;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 
 const FILE_READ_DATA: u32 = 0x1;
@@ -135,15 +137,21 @@ pub fn untrusted_access(dir: &Path, user: &str, rights: u32, verb: &str) -> Resu
                     );
                 }
                 let header = &*ace.cast::<ACE_HEADER>();
-                // Entries for children only, and deny or audit entries,
-                // grant nothing on this directory.
-                if header.AceFlags & INHERIT_ONLY_ACE != 0
-                    || !matches!(
-                        header.AceType,
-                        ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
-                    )
-                {
+                // Entries for children only grant nothing on this directory;
+                // nor do deny or audit entries
+                if header.AceFlags & INHERIT_ONLY_ACE != 0 {
                     continue;
+                }
+                match header.AceType {
+                    ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => {}
+                    // Object entries carry their SID at another offset; not
+                    // reading them, assume they may let someone in
+                    ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
+                        return Ok(Some(
+                            "it has an object access entry this check cannot read".into(),
+                        ));
+                    }
+                    _ => continue,
                 }
                 let allowed = &*ace.cast::<ACCESS_ALLOWED_ACE>();
                 if allowed.Mask & rights == 0 {

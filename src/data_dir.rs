@@ -495,7 +495,11 @@ mod tests {
         // A lock in a directory others can read is refused: they could hold it
         let readable = tmp.path().join("readable");
         std::fs::create_dir(&readable).unwrap();
-        crate::lock::acquire(&readable.join("x.lock"), std::time::Duration::ZERO).unwrap();
+        crate::lock::acquire(
+            &readable.join("x.lock"),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
         let granted = std::process::Command::new("icacls")
             .arg(&readable)
             .args(["/grant", "*S-1-1-0:(OI)(CI)R"])

@@ -198,6 +198,12 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    // Where worktrees live; no project may go there
+    let worktrees = config
+        .worktrees_dir
+        .as_deref()
+        .and_then(|dir| relative_dir(base_dir, dir).ok())
+        .unwrap_or_else(|| ".worktrees".to_string());
     let mut entries: Vec<_> = config.projects.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let checked: Vec<(ProjectInfo, PathBuf)> = entries
@@ -231,7 +237,7 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
                 depends_on,
                 meta,
             };
-            let location = validate_project(base_dir, &mut info).map_err(|reason| {
+            let location = validate_project(base_dir, &worktrees, &mut info).map_err(|reason| {
                 anyhow::anyhow!(
                     "Invalid project '{}' in {}: {reason}",
                     escape(&info.name),
@@ -268,7 +274,11 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 /// - Tags hold no whitespace and no `,`, which the `--tag` filter splits on.
 ///
 /// Returns where the project lives on disk (see [`resolve_inside`]).
-fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, String> {
+fn validate_project(
+    base_dir: &Path,
+    worktrees: &str,
+    info: &mut ProjectInfo,
+) -> Result<PathBuf, String> {
     let lists = [
         ("tag", &info.tags),
         ("provides entry", &info.provides),
@@ -314,14 +324,14 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, 
         return Err(format!("tag '{tag}' contains whitespace or ','"));
     }
     info.path = normalize_project_path(&info.path)?;
+    let in_worktrees = |value: &str| {
+        let (value, worktrees) = (value.to_ascii_lowercase(), worktrees.to_ascii_lowercase());
+        value == worktrees || value.starts_with(&format!("{worktrees}/"))
+    };
     for value in [&info.name, &info.path] {
-        if value
-            .split('/')
-            .next()
-            .is_some_and(|first| first.eq_ignore_ascii_case(".worktrees"))
-        {
+        if in_worktrees(value) {
             return Err(format!(
-                "'{value}' is inside .worktrees, where worktrees live"
+                "'{value}' is inside {worktrees}, where worktrees live"
             ));
         }
     }
@@ -335,13 +345,9 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, 
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        if parts.iter().any(|p| p.eq_ignore_ascii_case(".git"))
-            || parts
-                .first()
-                .is_some_and(|p| p.eq_ignore_ascii_case(".worktrees"))
-        {
+        if parts.iter().any(|p| p.eq_ignore_ascii_case(".git")) || in_worktrees(&parts.join("/")) {
             return Err(format!(
-                "path '{}' leads into .git or .worktrees through a symlink",
+                "path '{}' leads into .git or {worktrees} through a symlink",
                 info.path
             ));
         }
@@ -1586,6 +1592,10 @@ mod tests {
             (
                 r#"{"projects": {"p": {"repo": "u", "path": ".worktrees/t"}}}"#,
                 "inside .worktrees",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "sets/x"}}, "worktrees_dir": "sets"}"#,
+                "inside sets",
             ),
             (r#"{"projects": {"x|y": "u"}}"#, "ASCII letters"),
             (

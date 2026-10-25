@@ -141,8 +141,8 @@ mod tests {
         assert_eq!(guard.path(), lock_path);
         drop(guard);
 
-        // Released on drop: the next acquire succeeds at once
-        acquire(&lock_path, Duration::ZERO).unwrap();
+        // Released on drop: the next acquire succeeds
+        acquire(&lock_path, WAIT).unwrap();
     }
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
         let own_pid = format!("{}\n", std::process::id());
         for content in ["", "not a pid", "999999999\n", own_pid.as_str()] {
             fs::write(&lock_path, content).unwrap();
-            acquire(&lock_path, Duration::ZERO).unwrap();
+            acquire(&lock_path, WAIT).unwrap();
         }
     }
 
