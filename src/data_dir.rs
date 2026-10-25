@@ -63,42 +63,85 @@ fn create_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// Refuse a directory that another user owns or can write to: they could
-/// replace the stores, locks or plugins in it. The same goes for every
-/// directory above it (after following symlinks), since another user who can
-/// rename entries there could swap the whole directory: each must belong to
-/// you or root and be writable by no one else, unless it is sticky (`/tmp`).
+/// replace the stores, locks or plugins in it.
+///
+/// The same goes for every directory the path passes through, as written and
+/// through each symlink it follows, since another user who can rename entries
+/// in one of them could swap what the path leads to. Each such directory must
+/// belong to you or root and be writable by no one else, unless it is sticky
+/// like `/tmp` (then only an entry's owner can rename it).
 #[cfg(unix)]
 pub fn check_private_dir(dir: &Path) -> Result<()> {
+    use std::ffi::OsString;
     use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
 
     let shown = crate::display::escape_path(dir);
-    let real = dir
-        .canonicalize()
-        .with_context(|| format!("Failed to resolve {shown}"))?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    let meta = std::fs::metadata(&real).with_context(|| format!("Failed to stat {shown}"))?;
-    if meta.uid() != uid {
-        anyhow::bail!(
-            "Refusing to use {shown}: it is owned by uid {}, not by you (uid {uid})",
-            meta.uid()
-        );
+    let stat = |path: &Path| {
+        std::fs::symlink_metadata(path).with_context(|| {
+            format!(
+                "Failed to check {shown}: cannot stat {}",
+                crate::display::escape_path(path)
+            )
+        })
+    };
+
+    // Resolve the path one component at a time, checking the directory that
+    // holds each entry before following it.
+    let absolute = std::env::current_dir()
+        .context("Failed to read the current directory")?
+        .join(dir);
+    let mut pending: Vec<OsString> = Vec::new();
+    let push_rev = |pending: &mut Vec<OsString>, path: &Path| {
+        for c in path.components().rev() {
+            match c {
+                Component::Normal(n) => pending.push(n.to_os_string()),
+                Component::ParentDir => pending.push(OsString::from("..")),
+                Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+            }
+        }
+    };
+    push_rev(&mut pending, &absolute);
+    let mut current = PathBuf::from("/");
+    let mut hops = 0;
+    while let Some(name) = pending.pop() {
+        if name == ".." {
+            current.pop();
+            continue;
+        }
+        let holder = stat(&current)?;
+        let sticky = holder.mode() & 0o1000 != 0;
+        if (holder.uid() != uid && holder.uid() != 0) || (holder.mode() & 0o022 != 0 && !sticky) {
+            anyhow::bail!(
+                "Refusing to use {shown}: another user could replace it through {}",
+                crate::display::escape_path(&current)
+            );
+        }
+        let next = current.join(&name);
+        if stat(&next)?.file_type().is_symlink() {
+            hops += 1;
+            anyhow::ensure!(hops <= 40, "Failed to check {shown}: too many symlinks");
+            let target = std::fs::read_link(&next)
+                .with_context(|| format!("Failed to check {shown}: cannot read a symlink"))?;
+            if target.is_absolute() {
+                current = PathBuf::from("/");
+            }
+            push_rev(&mut pending, &target);
+        } else {
+            current = next;
+        }
+    }
+
+    let meta = stat(&current)?;
+    if !meta.is_dir() || meta.uid() != uid {
+        anyhow::bail!("Refusing to use {shown}: it is not a directory owned by you (uid {uid})");
     }
     if meta.mode() & 0o022 != 0 {
         anyhow::bail!(
             "Refusing to use {shown}: other users can write to it (fix with: chmod go-w '{shown}')"
         );
-    }
-    for ancestor in real.ancestors().skip(1) {
-        let meta = std::fs::metadata(ancestor)
-            .with_context(|| format!("Failed to stat {}", crate::display::escape_path(ancestor)))?;
-        let sticky = meta.mode() & 0o1000 != 0;
-        if (meta.uid() != uid && meta.uid() != 0) || (meta.mode() & 0o022 != 0 && !sticky) {
-            anyhow::bail!(
-                "Refusing to use {shown}: another user could replace it through {}",
-                crate::display::escape_path(ancestor)
-            );
-        }
     }
     Ok(())
 }
@@ -147,6 +190,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         let err = check_private_dir(&dir).unwrap_err().to_string();
+        assert!(err.contains("another user could replace it"), "{err}");
+
+        // A link to it from a shared dir is refused too: the link can be swapped
+        let link_home = tmp.path().join("links");
+        std::fs::create_dir(&link_home).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        check_private_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, link_home.join("meta")).unwrap();
+        check_private_dir(&link_home.join("meta")).unwrap();
+        std::fs::set_permissions(&link_home, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = check_private_dir(&link_home.join("meta"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("another user could replace it"), "{err}");
 
         // A sticky parent, like /tmp, keeps others from renaming it
