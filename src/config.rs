@@ -357,10 +357,11 @@ pub fn relative_dir(base_dir: &Path, raw: &str) -> Result<String, String> {
     // An absolute path is fine when it lies inside base_dir
     let raw_path = Path::new(raw);
     let relative = if raw_path.is_absolute() {
+        // the real path of the nearest part that exists, then the rest
         let real = |p: &Path| {
-            p.canonicalize()
-                .ok()
-                .or_else(|| Some(p.parent()?.canonicalize().ok()?.join(p.file_name()?)))
+            let existing = p.ancestors().find(|a| a.exists())?;
+            let rest = p.strip_prefix(existing).ok()?;
+            Some(existing.canonicalize().ok()?.join(rest))
         };
         real(base_dir)
             .zip(real(raw_path))
@@ -1656,6 +1657,15 @@ mod tests {
         assert_eq!(relative_dir(dir.path(), "wt").unwrap(), "wt");
         let inside = dir.path().join("custom").to_string_lossy().into_owned();
         assert_eq!(relative_dir(dir.path(), &inside).unwrap(), "custom");
+        let deeper = dir
+            .path()
+            .join("build/worktrees")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            relative_dir(dir.path(), &deeper).unwrap(),
+            "build/worktrees"
+        );
         assert!(relative_dir(dir.path(), "../out").is_err());
         assert!(relative_dir(dir.path(), "/").is_err());
     }
