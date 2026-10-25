@@ -409,7 +409,18 @@ pub fn relative_dir(base_dir: &Path, raw: &str) -> Result<String, String> {
         raw.to_string()
     };
     let normal = normalize_project_path(&relative)?;
-    resolve_inside(base_dir, &normal)?;
+    let location = resolve_inside(base_dir, &normal)?;
+    // Nor may it lead into git's own data
+    let base = base_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", escape_path(base_dir)))?;
+    if location.strip_prefix(&base).is_ok_and(|inside| {
+        inside
+            .components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case(".git"))
+    }) {
+        return Err(format!("'{}' leads into .git", escape(raw)));
+    }
     Ok(normal)
 }
 
@@ -1732,6 +1743,15 @@ mod tests {
             "build/worktrees"
         );
         assert!(relative_dir(dir.path(), "../out").is_err());
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(dir.path().join(".git")).unwrap();
+            std::os::unix::fs::symlink(dir.path().join(".git"), dir.path().join("storage"))
+                .unwrap();
+            assert!(relative_dir(dir.path(), "storage")
+                .unwrap_err()
+                .contains("leads into .git"));
+        }
         // a value from the config is escaped in the message
         let err = relative_dir(dir.path(), "../bad\nFORGED").unwrap_err();
         assert!(!err.contains('\n') && err.contains("bad\\nFORGED"), "{err}");
