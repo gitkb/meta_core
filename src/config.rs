@@ -650,12 +650,22 @@ pub fn walk_meta_tree(
 
     let (projects, _ignore) = parse_meta_config(&config_path)?;
     let meta_dir = config_path.parent().unwrap_or(Path::new("."));
+    walk_projects(meta_dir, &projects, max_depth)
+}
 
+/// The meta tree whose top level is `projects`, the parsed config in
+/// `meta_dir` (such as one chosen with `--config`), walked like
+/// [`walk_meta_tree`]. A nested config that fails to parse is an error.
+pub fn walk_projects(
+    meta_dir: &Path,
+    projects: &[ProjectInfo],
+    max_depth: Option<usize>,
+) -> anyhow::Result<Vec<MetaTreeNode>> {
     let mut visited = std::collections::HashSet::new();
     visited.insert(meta_dir.canonicalize().unwrap_or(meta_dir.to_path_buf()));
 
     let depth = max_depth.unwrap_or(usize::MAX);
-    walk_inner(meta_dir, &projects, depth, 0, &mut visited)
+    walk_inner(meta_dir, projects, depth, 0, &mut visited)
 }
 
 /// Flatten a meta tree into fully-qualified path strings.
