@@ -62,41 +62,72 @@ pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
     check_private_dir(dir)
 }
 
-/// Refuse a file that meta will run, such as a plugin, if another user could
-/// change or replace it: the directory it really lives in (after symlinks)
-/// must pass [`check_private_dir`], and the file itself must belong to you
-/// or root and be writable by no one else.
+/// Refuse a file that meta will run or trust, such as a plugin, if another
+/// user could change or replace it. The path is followed one link at a time,
+/// as the system will follow it later: the directory holding each link and
+/// the final file must pass [`check_private_dir`], each link must belong to
+/// you or root, and the file itself must belong to you or root and be
+/// writable by no one else.
 pub fn check_trusted_file(path: &Path) -> Result<()> {
     let shown = crate::display::escape_path(path);
-    let real = path
-        .canonicalize()
-        .with_context(|| format!("Failed to resolve {shown}"))?;
-    if let Some(parent) = real.parent() {
-        check_private_dir(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(&real).with_context(|| format!("Failed to stat {shown}"))?;
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        let uid = unsafe { libc::geteuid() };
-        if !owned_by_you_or_root(&meta, uid) || meta.mode() & 0o022 != 0 || acl_allows_others(&real)
+    let mut current =
+        std::path::absolute(path).with_context(|| format!("Failed to resolve {shown}"))?;
+    for _ in 0..40 {
+        let parent = current
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Refusing to use {shown}: it has no parent directory"))?
+            .to_path_buf();
+        check_private_dir(&parent)?;
+        let meta = std::fs::symlink_metadata(&current)
+            .with_context(|| format!("Failed to stat {shown}"))?;
+        if meta.file_type().is_symlink() {
+            #[cfg(unix)]
+            {
+                // SAFETY: geteuid has no preconditions and cannot fail.
+                let uid = unsafe { libc::geteuid() };
+                if !owned_by_you_or_root(&meta, uid) {
+                    anyhow::bail!(
+                        "Refusing to use {shown}: the symlink {} belongs to another user",
+                        crate::display::escape_path(&current)
+                    );
+                }
+            }
+            let target = std::fs::read_link(&current)
+                .with_context(|| format!("Failed to read the symlink {shown}"))?;
+            current = parent.join(target);
+            continue;
+        }
+        #[cfg(unix)]
         {
-            anyhow::bail!(
-                "Refusing to use {shown}: another user owns it or can change it \
-                 (fix with: chmod go-w '{shown}')"
-            );
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let uid = unsafe { libc::geteuid() };
+            if !meta.is_file()
+                || !owned_by_you_or_root(&meta, uid)
+                || meta.mode() & 0o022 != 0
+                || acl_allows_others(&current)
+            {
+                anyhow::bail!(
+                    "Refusing to use {shown}: another user owns it or can change it \
+                     (fix with: chmod go-w '{shown}')"
+                );
+            }
         }
-    }
-    #[cfg(windows)]
-    {
-        use crate::win_acl::{current_user_sid, untrusted_access, DIR_RIGHTS};
-        let user = current_user_sid()?;
-        if let Some(why) = untrusted_access(&real, &user, DIR_RIGHTS, "change")? {
-            anyhow::bail!("Refusing to use {shown}: {why}");
+        #[cfg(windows)]
+        {
+            use crate::win_acl::{current_user_sid, untrusted_access, DIR_RIGHTS};
+            if !meta.is_file() {
+                anyhow::bail!("Refusing to use {shown}: it is not a regular file");
+            }
+            if let Some(why) =
+                untrusted_access(&current, &current_user_sid()?, DIR_RIGHTS, "change")?
+            {
+                anyhow::bail!("Refusing to use {shown}: {why}");
+            }
         }
+        return Ok(());
     }
-    Ok(())
+    anyhow::bail!("Refusing to use {shown}: too many symlinks")
 }
 
 /// Refuse a directory that another user owns or can write to: they could
@@ -258,7 +289,9 @@ pub(crate) fn acl_allows_others(path: &Path) -> bool {
     unsafe {
         let acl = acl_get_link_np(c_path.as_ptr(), ACL_TYPE_EXTENDED);
         if acl.is_null() {
-            return false; // no ACL
+            // ENOENT means there is no ACL; anything else is not knowing,
+            // which is treated as an ACL that may let others in
+            return std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT);
         }
         let mut allows = false;
         let mut entry: *mut c_void = std::ptr::null_mut();
@@ -487,12 +520,12 @@ mod tests {
             .unwrap();
         assert!(granted.success());
         let store = files_only.join("store.json");
-        crate::store::write_atomic(&store, &std::collections::HashMap::<String, String>::new())
-            .unwrap();
-        let err = crate::store::read::<std::collections::HashMap<String, String>>(&store)
-            .unwrap_err()
-            .to_string();
+        let err =
+            crate::store::write_atomic(&store, &std::collections::HashMap::<String, String>::new())
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("S-1-1-0 may change it"), "{err}");
+        assert!(!store.exists());
     }
 
     #[cfg(target_os = "macos")]
@@ -549,6 +582,17 @@ mod tests {
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         std::os::unix::fs::symlink(shared.join("meta-x"), &plugin).unwrap();
         assert!(check_trusted_file(&plugin).is_err());
+
+        // So is one that passes through a link in such a directory, even
+        // when the link ends at a safe file: the link can be switched
+        let safe = tmp.path().join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::write(safe.join("meta-y"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(safe.join("meta-y"), shared.join("forward")).unwrap();
+        let indirect = tmp.path().join("meta-y");
+        std::os::unix::fs::symlink(shared.join("forward"), &indirect).unwrap();
+        check_trusted_file(&safe.join("meta-y")).unwrap();
+        assert!(check_trusted_file(&indirect).is_err());
     }
 
     #[cfg(unix)]

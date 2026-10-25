@@ -1,7 +1,7 @@
 //! Atomic JSON store read/write with lock-protected updates.
 //!
 //! Provides generic utilities for reading, writing, and updating JSON files
-//! with atomic write semantics (write to `.tmp`, then rename) and optional
+//! with atomic write semantics (write to a temporary file, then rename) and optional
 //! lock protection for concurrent access.
 
 use crate::display::escape_path;
@@ -33,7 +33,7 @@ pub fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 
 /// Write data to a JSON file atomically.
 ///
-/// Writes to a temporary file (`.tmp` suffix) then renames to the target path.
+/// Writes to a temporary file beside it, then renames it to the target path.
 /// This ensures readers never see a partially-written file.
 pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
     // Ensure parent directory exists
@@ -43,13 +43,18 @@ pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
         }
     }
 
-    let tmp_path = path.with_extension("tmp");
+    // One temp file per writer (a fixed name lets two writers interleave),
+    // created fresh, readable and writable by you alone
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
 
     let json =
         serde_json::to_string_pretty(data).with_context(|| "Failed to serialize store data")?;
 
-    // A fresh file readable and writable by you alone (a leftover one from a
-    // crash is replaced, whatever its mode)
     let _ = std::fs::remove_file(&tmp_path);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -62,10 +67,18 @@ pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
         .with_context(|| format!("Failed to write temp file: {}", escape_path(&tmp_path)))?;
     drop(file);
 
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("Failed to rename temp file to: {}", escape_path(path)))?;
-
-    Ok(())
+    // What it inherited (an access list on Windows, a macOS ACL) must not
+    // let others change it, or the next read would refuse it
+    if let Err(e) = check_private_file(&tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    let renamed = std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("Failed to rename temp file to: {}", escape_path(path)));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    renamed
 }
 
 /// Refuse to read a store file another user could have written: anything but
@@ -80,15 +93,25 @@ pub fn check_private_file(path: &Path) -> Result<()> {
         .with_context(|| format!("Failed to stat {}", escape_path(path)))?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    if !meta.is_file()
-        || meta.uid() != uid
-        || meta.mode() & 0o022 != 0
-        || crate::data_dir::acl_allows_others(path)
-    {
+    let shown = escape_path(path);
+    if !meta.is_file() {
+        anyhow::bail!("Refusing to read {shown}: it is not a regular file (such as a symlink)");
+    }
+    if meta.uid() != uid {
         anyhow::bail!(
-            "Refusing to read {}: it must be a regular file owned by you that no one else can \
-             write (fix with: chmod go-w, or remove it)",
-            escape_path(path)
+            "Refusing to read {shown}: it belongs to uid {}, not to you (uid {uid})",
+            meta.uid()
+        );
+    }
+    if meta.mode() & 0o022 != 0 {
+        anyhow::bail!(
+            "Refusing to read {shown}: other users can write to it (fix with: chmod go-w '{shown}')"
+        );
+    }
+    if crate::data_dir::acl_allows_others(path) {
+        anyhow::bail!(
+            "Refusing to read {shown}: its access control list lets others in \
+             (remove with: chmod -N '{shown}')"
         );
     }
     Ok(())
@@ -184,7 +207,7 @@ mod tests {
         assert_eq!(loaded.items.get("key").unwrap(), "value");
 
         // Ensure tmp file was cleaned up
-        assert!(!path.with_extension("tmp").exists());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     #[test]

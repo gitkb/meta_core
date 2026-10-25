@@ -254,7 +254,9 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 /// join `path` onto the directory of the `.meta` file without checking again:
 /// - No value (name, path, repo, tags, provides, depends_on) is empty or holds
 ///   a control or bidirectional-control character ([`is_unsafe_char`]).
-/// - `name` is one path component: not `.` or `..`, no `/` or `\`.
+/// - `name` is a relative path in normal form (usually one component; a
+///   nested alias like `vendor/lib` is a worktree destination too), held to
+///   the same rules as `path`.
 /// - The name and every path component pass [`component_problem`]: ASCII
 ///   letters, digits, space and `._-+@` only, no trailing dot or space, no
 ///   Windows device name, not `.git`. The first component is not `.worktrees`.
@@ -291,11 +293,15 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, 
             ));
         }
     }
-    if matches!(info.name.as_str(), "." | "..") || info.name.contains(['/', '\\']) {
-        return Err("name must be a single path component (no '/', '\\', '.' or '..')".into());
-    }
-    if let Some(why) = component_problem(&info.name) {
-        return Err(format!("name has {why}"));
+    // A name may be a relative path, such as `vendor/lib` for a nested
+    // repo: worktrees put the project at `<worktree>/<name>`. So it follows
+    // the path rules, and must already be in their normal form.
+    let normal = normalize_project_path(&info.name).map_err(|why| format!("name: {why}"))?;
+    if normal != info.name {
+        return Err(format!(
+            "name must be a plain relative path such as 'api' or 'vendor/lib', not '{}'",
+            info.name
+        ));
     }
     if info.repo.as_deref().is_some_and(|r| r.starts_with('-')) {
         return Err("repo must not start with '-'".into());
@@ -308,6 +314,17 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, 
         return Err(format!("tag '{tag}' contains whitespace or ','"));
     }
     info.path = normalize_project_path(&info.path)?;
+    for value in [&info.name, &info.path] {
+        if value
+            .split('/')
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(".worktrees"))
+        {
+            return Err(format!(
+                "'{value}' is inside .worktrees, where worktrees live"
+            ));
+        }
+    }
     let location = resolve_inside(base_dir, &info.path)?;
     // Where it really goes must not be reserved either (`alias -> .git`)
     let base = base_dir
@@ -330,6 +347,35 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, 
         }
     }
     Ok(location)
+}
+
+/// Check a directory a config names relative to its own directory, such as
+/// `worktrees_dir`, by the rules for project paths, and return its normal
+/// form. (An absolute or outside location is the user's to choose, through
+/// an environment variable such as `META_WORKTREES`, not the config's.)
+pub fn relative_dir(base_dir: &Path, raw: &str) -> Result<String, String> {
+    // An absolute path is fine when it lies inside base_dir
+    let raw_path = Path::new(raw);
+    let relative = if raw_path.is_absolute() {
+        let real = |p: &Path| {
+            p.canonicalize()
+                .ok()
+                .or_else(|| Some(p.parent()?.canonicalize().ok()?.join(p.file_name()?)))
+        };
+        real(base_dir)
+            .zip(real(raw_path))
+            .and_then(|(base, path)| {
+                path.strip_prefix(base)
+                    .ok()
+                    .map(|rest| rest.to_string_lossy().into_owned())
+            })
+            .ok_or_else(|| format!("'{raw}' is outside {}", escape_path(base_dir)))?
+    } else {
+        raw.to_string()
+    };
+    let normal = normalize_project_path(&relative)?;
+    resolve_inside(base_dir, &normal)?;
+    Ok(normal)
 }
 
 /// Refuse two projects at one location, or one inside another's directory:
@@ -431,14 +477,6 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
             "path '{raw}' must name a directory below the .meta file"
         ));
     }
-    if parts
-        .first()
-        .is_some_and(|first| first.eq_ignore_ascii_case(".worktrees"))
-    {
-        return Err(format!(
-            "path '{raw}' is inside .worktrees, where worktrees live"
-        ));
-    }
     Ok(parts.join("/"))
 }
 
@@ -450,6 +488,9 @@ pub fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let base = base_dir
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", escape_path(base_dir)))?;
+    if rel.starts_with('/') || rel.split('/').any(|part| matches!(part, "" | "." | "..")) {
+        return Err(format!("path '{rel}' must be a plain relative path"));
+    }
     let mut current = base.clone();
     let mut exists = true;
     for part in rel.split('/') {
@@ -1324,10 +1365,7 @@ mod tests {
 
     fn parse_err(json: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".meta"), json).unwrap();
-        parse_meta_config(&dir.path().join(".meta"))
-            .unwrap_err()
-            .to_string()
+        parse_err_in(dir.path(), json)
     }
 
     #[test]
@@ -1355,12 +1393,16 @@ mod tests {
         for (json, what) in [
             (
                 r#"{"projects": {"../../../../escaped-wt": {"repo": "u", "path": "a"}}}"#,
-                "single path component",
+                "name: path '../../../../escaped-wt' must not contain '..'",
             ),
-            (r#"{"projects": {"a/b": "u"}}"#, "single path component"),
+            (
+                r#"{"projects": {"/abs": "u"}}"#,
+                "name: path '/abs' must be relative",
+            ),
+            (r#"{"projects": {"a//b": "u"}}"#, "plain relative path"),
             (
                 r#"{"projects": {"..": {"repo": "u", "path": "a"}}}"#,
-                "single path component",
+                "must not contain '..'",
             ),
             (
                 r#"{"projects": {"x\u001b]0;T\u0007": "u"}}"#,
@@ -1592,6 +1634,30 @@ mod tests {
         )
         .unwrap();
         assert!(parse_meta_config(&dir.path().join(".meta")).is_ok());
+    }
+
+    #[test]
+    fn test_parse_accepts_nested_alias_names() {
+        // as gitkb's .meta.yaml lists `vendor/tree-sitter-markdown`
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".meta.yaml"),
+            "projects:\n  core: u\n  vendor/tree-sitter-markdown: u\n",
+        )
+        .unwrap();
+        let (projects, _) = parse_meta_config(&dir.path().join(".meta.yaml")).unwrap();
+        assert_eq!(projects[1].name, "vendor/tree-sitter-markdown");
+        assert_eq!(projects[1].path, "vendor/tree-sitter-markdown");
+    }
+
+    #[test]
+    fn test_relative_dir_stays_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(relative_dir(dir.path(), "wt").unwrap(), "wt");
+        let inside = dir.path().join("custom").to_string_lossy().into_owned();
+        assert_eq!(relative_dir(dir.path(), &inside).unwrap(), "custom");
+        assert!(relative_dir(dir.path(), "../out").is_err());
+        assert!(relative_dir(dir.path(), "/").is_err());
     }
 
     #[test]

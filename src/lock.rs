@@ -40,24 +40,40 @@ pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
     if let Some(parent) = lock_path.parent() {
         crate::data_dir::create_private_dir(parent)?;
     }
+    // A symlink here could lead every meta process to a different file
+    if std::fs::symlink_metadata(lock_path).is_ok_and(|meta| !meta.is_file()) {
+        anyhow::bail!(
+            "Refusing to lock {}: it is not a regular file (such as a symlink)",
+            escape_path(lock_path)
+        );
+    }
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     // Readable by no one else: anyone who can open the file can hold the
     // lock and block every store write
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
     let file = options
         .open(lock_path)
         .with_context(|| format!("Failed to open lock file: {}", escape_path(lock_path)))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        // a lock file left by an older meta may still be 0644
-        let mode = file
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = file
             .metadata()
-            .with_context(|| format!("Failed to stat {}", escape_path(lock_path)))?
-            .permissions()
-            .mode();
+            .with_context(|| format!("Failed to stat {}", escape_path(lock_path)))?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+            anyhow::bail!(
+                "Refusing to lock {}: it is not a regular file of yours",
+                escape_path(lock_path)
+            );
+        }
+        // a lock file left by an older meta may still be 0644
+        let mode = meta.permissions().mode();
         if mode & 0o077 != 0 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("Failed to restrict {}", escape_path(lock_path)))?;
@@ -75,8 +91,9 @@ pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
     }
     #[cfg(windows)]
     {
-        use crate::win_acl::{current_user_sid, untrusted_access, READ_RIGHTS};
-        if let Some(why) = untrusted_access(lock_path, &current_user_sid()?, READ_RIGHTS, "open")? {
+        use crate::win_acl::{current_user_sid, untrusted_access, DIR_RIGHTS, READ_RIGHTS};
+        let rights = READ_RIGHTS | DIR_RIGHTS;
+        if let Some(why) = untrusted_access(lock_path, &current_user_sid()?, rights, "open")? {
             anyhow::bail!(
                 "Refusing to lock {}: {why}, so another account could hold the lock",
                 escape_path(lock_path)
@@ -150,6 +167,18 @@ mod tests {
             fs::write(&lock_path, content).unwrap();
             acquire(&lock_path, Duration::ZERO).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_lock_refuses_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::write(&elsewhere, "").unwrap();
+        let lock_path = tmp.path().join("x.lock");
+        std::os::unix::fs::symlink(&elsewhere, &lock_path).unwrap();
+        let err = acquire(&lock_path, WAIT).err().unwrap().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
     }
 
     #[cfg(unix)]
