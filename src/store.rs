@@ -106,7 +106,9 @@ pub fn check_private_file(path: &Path) -> Result<()> {
     }
     if meta.uid() != uid {
         anyhow::bail!(
-            "Refusing to read {shown}: it belongs to uid {}, not to you (uid {uid})",
+            "Refusing to read {shown}: it belongs to uid {}, not to you (uid {uid}); \
+             if meta ran as that user (such as with sudo), take it back with: \
+             sudo chown {uid} '{shown}'",
             meta.uid()
         );
     }

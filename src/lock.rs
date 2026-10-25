@@ -68,7 +68,10 @@ pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
         // SAFETY: geteuid has no preconditions and cannot fail.
         if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
             anyhow::bail!(
-                "Refusing to lock {}: it is not a regular file of yours",
+                "Refusing to lock {}: it is not a regular file of yours \
+                 (if it was left by meta run as another user, such as with sudo, \
+                 remove it: rm '{}')",
+                escape_path(lock_path),
                 escape_path(lock_path)
             );
         }
