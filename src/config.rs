@@ -198,12 +198,17 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    // Where worktrees live; no project may go there
-    let worktrees = config
-        .worktrees_dir
-        .as_deref()
-        .and_then(|dir| relative_dir(base_dir, dir).ok())
-        .unwrap_or_else(|| ".worktrees".to_string());
+    // Where worktrees live (as written, and where that really is); no
+    // project may go there. A bad worktrees_dir is an error like a bad entry.
+    let worktrees = match config.worktrees_dir.as_deref() {
+        Some(dir) => relative_dir(base_dir, dir).map_err(|why| {
+            anyhow::anyhow!("Invalid worktrees_dir in {}: {why}", escape_path(meta_path))
+        })?,
+        None => ".worktrees".to_string(),
+    };
+    let worktrees_at = resolve_inside(base_dir, &worktrees)
+        .ok()
+        .map(|at| PathBuf::from(at.to_string_lossy().to_lowercase()));
     let mut entries: Vec<_> = config.projects.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let checked: Vec<(ProjectInfo, PathBuf)> = entries
@@ -237,13 +242,15 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
                 depends_on,
                 meta,
             };
-            let location = validate_project(base_dir, &worktrees, &mut info).map_err(|reason| {
-                anyhow::anyhow!(
-                    "Invalid project '{}' in {}: {reason}",
-                    escape(&info.name),
-                    escape_path(meta_path)
-                )
-            })?;
+            let location =
+                validate_project(base_dir, &worktrees, worktrees_at.as_deref(), &mut info)
+                    .map_err(|reason| {
+                        anyhow::anyhow!(
+                            "Invalid project '{}' in {}: {reason}",
+                            escape(&info.name),
+                            escape_path(meta_path)
+                        )
+                    })?;
             Ok((info, location))
         })
         .collect::<anyhow::Result<_>>()?;
@@ -277,6 +284,7 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 fn validate_project(
     base_dir: &Path,
     worktrees: &str,
+    worktrees_at: Option<&Path>,
     info: &mut ProjectInfo,
 ) -> Result<PathBuf, String> {
     let lists = [
@@ -345,7 +353,11 @@ fn validate_project(
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        if parts.iter().any(|p| p.eq_ignore_ascii_case(".git")) || in_worktrees(&parts.join("/")) {
+        let lowered = PathBuf::from(location.to_string_lossy().to_lowercase());
+        if parts.iter().any(|p| p.eq_ignore_ascii_case(".git"))
+            || in_worktrees(&parts.join("/"))
+            || worktrees_at.is_some_and(|at| lowered.starts_with(at))
+        {
             return Err(format!(
                 "path '{}' leads into .git or {worktrees} through a symlink",
                 info.path
@@ -391,7 +403,9 @@ pub fn relative_dir(base_dir: &Path, raw: &str) -> Result<String, String> {
 /// through existing symlinks, and without case, which some filesystems
 /// ignore. A repo inside another belongs in a nested `.meta` (`meta: true`).
 fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
-    let keyed: Vec<_> = projects
+    // Paths, by where they resolve; and names, which worktrees use as
+    // destinations (`<worktree>/<name>`)
+    let by_location: Vec<_> = projects
         .iter()
         .map(|(info, location)| {
             (
@@ -400,26 +414,44 @@ fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
             )
         })
         .collect();
-    for (i, (outer_key, outer)) in keyed.iter().enumerate() {
-        for (inner_key, inner) in keyed.iter().skip(i + 1) {
-            let (outer, inner) = if inner_key.starts_with(outer_key) {
-                (outer, inner)
-            } else if outer_key.starts_with(inner_key) {
-                (inner, outer)
-            } else {
-                continue;
-            };
-            return Err(format!(
-                "project '{}' (path '{}') is at or inside project '{}' (path '{}'); \
-                 list it in a nested .meta instead",
-                escape(&inner.name),
-                escape(&inner.path),
-                escape(&outer.name),
-                escape(&outer.path)
-            ));
-        }
+    if let Some((outer, inner)) = nested(&by_location) {
+        return Err(format!(
+            "project '{}' (path '{}') is at or inside project '{}' (path '{}'); \
+             list it in a nested .meta instead",
+            escape(&inner.name),
+            escape(&inner.path),
+            escape(&outer.name),
+            escape(&outer.path)
+        ));
+    }
+    let by_name: Vec<_> = projects
+        .iter()
+        .map(|(info, _)| (PathBuf::from(info.name.to_ascii_lowercase()), info))
+        .collect();
+    if let Some((outer, inner)) = nested(&by_name) {
+        return Err(format!(
+            "project name '{}' is the same as or inside '{}', and names are worktree \
+             destinations",
+            escape(&inner.name),
+            escape(&outer.name)
+        ));
     }
     Ok(())
+}
+
+/// The first pair whose keys are equal or nested, outer first.
+fn nested<'a>(keyed: &[(PathBuf, &'a ProjectInfo)]) -> Option<(&'a ProjectInfo, &'a ProjectInfo)> {
+    for (i, (outer_key, outer)) in keyed.iter().enumerate() {
+        for (inner_key, inner) in keyed.iter().skip(i + 1) {
+            if inner_key.starts_with(outer_key) {
+                return Some((outer, inner));
+            }
+            if outer_key.starts_with(inner_key) {
+                return Some((inner, outer));
+            }
+        }
+    }
+    None
 }
 
 /// What is wrong with a name or path component, if anything. The same
@@ -1684,6 +1716,38 @@ mod tests {
         let err = relative_dir(dir.path(), "../bad\nFORGED").unwrap_err();
         assert!(!err.contains('\n') && err.contains("bad\\nFORGED"), "{err}");
         assert!(relative_dir(dir.path(), "/").is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_nesting_or_colliding_names() {
+        let err = parse_err(
+            r#"{"projects": {"a": {"repo": "u", "path": "x"}, "a/b": {"repo": "u", "path": "y"}}}"#,
+        );
+        assert!(
+            err.contains("project name 'a/b' is the same as or inside 'a'"),
+            "{err}"
+        );
+        let err = parse_err(
+            r#"{"projects": {"API": {"repo": "u", "path": "x"}, "api": {"repo": "u", "path": "y"}}}"#,
+        );
+        assert!(err.contains("is the same as or inside"), "{err}");
+        let err = parse_err(r#"{"projects": {}, "worktrees_dir": "../out"}"#);
+        assert!(err.contains("Invalid worktrees_dir"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_projects_where_the_worktree_root_resolves() {
+        // .worktrees is a symlink to storage/, so storage/review is in it
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("storage")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("storage"), dir.path().join(".worktrees"))
+            .unwrap();
+        let err = parse_err_in(
+            dir.path(),
+            r#"{"projects": {"app": {"repo": "u", "path": "storage/review"}}}"#,
+        );
+        assert!(err.contains("through a symlink"), "{err}");
     }
 
     #[test]

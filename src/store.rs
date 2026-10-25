@@ -15,8 +15,15 @@ use std::path::Path;
 /// Returns an error if the file exists but can't be parsed, or if another
 /// user could have written it (see [`check_private_file`]).
 pub fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
-    if std::fs::symlink_metadata(path).is_err() {
-        return Ok(T::default());
+    // Only a missing file means an empty store: any other failure to look
+    // at it must not let an update replace every entry
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Failed to stat store file: {}", escape_path(path)))
+        }
+        Ok(_) => {}
     }
     check_private_file(path)?;
 
