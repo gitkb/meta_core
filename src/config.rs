@@ -370,7 +370,7 @@ pub fn relative_dir(base_dir: &Path, raw: &str) -> Result<String, String> {
                     .ok()
                     .map(|rest| rest.to_string_lossy().into_owned())
             })
-            .ok_or_else(|| format!("'{raw}' is outside {}", escape_path(base_dir)))?
+            .ok_or_else(|| format!("'{}' is outside {}", escape(raw), escape_path(base_dir)))?
     } else {
         raw.to_string()
     };
@@ -460,22 +460,25 @@ fn component_problem(part: &str) -> Option<&'static str> {
 fn normalize_project_path(raw: &str) -> Result<String, String> {
     let unified = raw.replace('\\', "/");
     if unified.starts_with('/') {
-        return Err(format!("path '{raw}' must be relative"));
+        return Err(format!("path '{}' must be relative", escape(raw)));
     }
     let mut parts = Vec::new();
     for part in unified.split('/') {
         match part {
             "" | "." => {}
-            ".." => return Err(format!("path '{raw}' must not contain '..'")),
+            ".." => return Err(format!("path '{}' must not contain '..'", escape(raw))),
             part => match component_problem(part) {
-                Some(why) => return Err(format!("path '{raw}' has a component with {why}")),
+                Some(why) => {
+                    return Err(format!("path '{}' has a component with {why}", escape(raw)))
+                }
                 None => parts.push(part),
             },
         }
     }
     if parts.is_empty() {
         return Err(format!(
-            "path '{raw}' must name a directory below the .meta file"
+            "path '{}' must name a directory below the .meta file",
+            escape(raw)
         ));
     }
     Ok(parts.join("/"))
@@ -1667,6 +1670,9 @@ mod tests {
             "build/worktrees"
         );
         assert!(relative_dir(dir.path(), "../out").is_err());
+        // a value from the config is escaped in the message
+        let err = relative_dir(dir.path(), "../bad\nFORGED").unwrap_err();
+        assert!(!err.contains('\n') && err.contains("bad\\nFORGED"), "{err}");
         assert!(relative_dir(dir.path(), "/").is_err());
     }
 
