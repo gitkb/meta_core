@@ -69,7 +69,7 @@ where
     T: DeserializeOwned + Default + Serialize,
     F: FnOnce(&mut T),
 {
-    let _guard = crate::lock::acquire(lock_path, 50, 100)?;
+    let _guard = crate::lock::acquire(lock_path, std::time::Duration::from_secs(5))?;
 
     let mut data: T = read(data_path)?;
     f(&mut data);
@@ -149,7 +149,7 @@ mod tests {
         assert_eq!(store.items.get("second").unwrap(), "2");
 
         // Lock should be released
-        assert!(!lock_path.exists());
+        assert!(crate::lock::acquire(&lock_path, std::time::Duration::ZERO).is_ok());
     }
 
     #[test]

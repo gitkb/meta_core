@@ -3,6 +3,7 @@
 //! This module provides the core types and functions for finding and parsing
 //! .meta configuration files (JSON and YAML formats).
 
+use crate::display::{escape, escape_path, is_unsafe_char};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -175,9 +176,12 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
             .with_context(|| format!("Failed to parse JSON config file: {}", meta_path.display()))?
     };
 
-    // Convert project entries to normalized ProjectInfo
-    let mut projects: Vec<ProjectInfo> = config
-        .projects
+    // Convert project entries to normalized, validated ProjectInfo
+    // in name order, so the first bad entry reported is always the same one
+    let base_dir = meta_path.parent().unwrap_or(Path::new("."));
+    let mut entries: Vec<_> = config.projects.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let projects: Vec<ProjectInfo> = entries
         .into_iter()
         .map(|(name, entry)| {
             let (repo, path, tags, provides, depends_on, meta) = match entry {
@@ -199,8 +203,7 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
                     (repo, resolved_path, tags, provides, depends_on, meta)
                 }
             };
-            let path = path.replace('\\', "/");
-            ProjectInfo {
+            let mut info = ProjectInfo {
                 name,
                 path,
                 repo,
@@ -208,14 +211,128 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
                 provides,
                 depends_on,
                 meta,
-            }
+            };
+            validate_project(base_dir, &mut info).map_err(|reason| {
+                anyhow::anyhow!(
+                    "Invalid project '{}' in {}: {reason}",
+                    escape(&info.name),
+                    escape_path(meta_path)
+                )
+            })?;
+            Ok(info)
         })
-        .collect();
-
-    // Sort projects alphabetically by name for deterministic order
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
+        .collect::<anyhow::Result<_>>()?;
 
     Ok((projects, config.ignore))
+}
+
+/// Check one project entry and normalize its path, or say what is wrong.
+///
+/// These rules are checked once, when a config is parsed, so every caller can
+/// join `path` onto the directory of the `.meta` file without checking again:
+/// - No value (name, path, repo, tags, provides, depends_on) is empty or holds
+///   a control or bidirectional-control character ([`is_unsafe_char`]).
+/// - `name` is one path component: not `.` or `..`, no `/` or `\`.
+/// - `path` (the name when omitted) is relative and stays inside the config's
+///   directory: `\` reads as `/`, empty and `.` components are dropped, `..`
+///   and drive prefixes (`C:`) are rejected, something must remain, and no
+///   symlink along it may lead outside the directory.
+/// - `repo` does not start with `-`, so git cannot read it as an option.
+/// - Tags hold no whitespace and no `,`, which the `--tag` filter splits on.
+fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<(), String> {
+    let lists = [
+        ("tag", &info.tags),
+        ("provides entry", &info.provides),
+        ("depends_on entry", &info.depends_on),
+    ];
+    for (what, value) in [("name", &info.name), ("path", &info.path)]
+        .into_iter()
+        .chain(info.repo.iter().map(|r| ("repo", r)))
+        .chain(
+            lists
+                .into_iter()
+                .flat_map(|(what, l)| l.iter().map(move |v| (what, v))),
+        )
+    {
+        if value.is_empty() {
+            return Err(format!("{what} is empty"));
+        }
+        if value.chars().any(is_unsafe_char) {
+            return Err(format!(
+                "{what} '{}' contains control characters",
+                escape(value)
+            ));
+        }
+    }
+    if matches!(info.name.as_str(), "." | "..") || info.name.contains(['/', '\\']) {
+        return Err("name must be a single path component (no '/', '\\', '.' or '..')".into());
+    }
+    if info.repo.as_deref().is_some_and(|r| r.starts_with('-')) {
+        return Err("repo must not start with '-'".into());
+    }
+    if let Some(tag) = info
+        .tags
+        .iter()
+        .find(|t| t.contains(|c: char| c.is_whitespace() || c == ','))
+    {
+        return Err(format!("tag '{tag}' contains whitespace or ','"));
+    }
+    info.path = normalize_project_path(&info.path)?;
+    check_no_symlink_escape(base_dir, &info.path)
+}
+
+/// Normalize a project path to `a/b` form, rejecting anything that is not a
+/// plain relative path below the config's directory.
+fn normalize_project_path(raw: &str) -> Result<String, String> {
+    let unified = raw.replace('\\', "/");
+    let mut chars = unified.chars();
+    let drive =
+        matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic());
+    if unified.starts_with('/') || drive || Path::new(raw).is_absolute() {
+        return Err(format!("path '{raw}' must be relative"));
+    }
+    let mut parts = Vec::new();
+    for part in unified.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return Err(format!("path '{raw}' must not contain '..'")),
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        return Err(format!(
+            "path '{raw}' must name a directory below the .meta file"
+        ));
+    }
+    Ok(parts.join("/"))
+}
+
+/// Refuse a path that reaches outside `base_dir` through a symlink that
+/// already exists (in the workspace or in a checked-out repo).
+fn check_no_symlink_escape(base_dir: &Path, rel: &str) -> Result<(), String> {
+    let Ok(base) = base_dir.canonicalize() else {
+        return Ok(()); // nothing on disk yet, so nothing to follow
+    };
+    let mut current = base.clone();
+    for part in rel.split('/') {
+        current.push(part);
+        let Ok(meta) = current.symlink_metadata() else {
+            return Ok(()); // the rest does not exist yet
+        };
+        if meta.file_type().is_symlink() {
+            match current.canonicalize() {
+                Ok(target) if target.starts_with(&base) => current = target,
+                _ => {
+                    return Err(format!(
+                        "path '{rel}' leads outside {} through the symlink '{}'",
+                        escape_path(&base),
+                        escape_path(&current)
+                    ))
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Load defaults from a meta config file.
@@ -275,7 +392,7 @@ pub fn walk_meta_tree(
     visited.insert(meta_dir.canonicalize().unwrap_or(meta_dir.to_path_buf()));
 
     let depth = max_depth.unwrap_or(usize::MAX);
-    Ok(walk_inner(meta_dir, &projects, depth, 0, &mut visited))
+    walk_inner(meta_dir, &projects, depth, 0, &mut visited)
 }
 
 /// Flatten a meta tree into fully-qualified path strings.
@@ -418,43 +535,39 @@ fn walk_inner(
     max_depth: usize,
     current_depth: usize,
     visited: &mut std::collections::HashSet<PathBuf>,
-) -> Vec<MetaTreeNode> {
+) -> anyhow::Result<Vec<MetaTreeNode>> {
     let mut nodes = Vec::new();
 
     for project in projects {
         let project_dir = base_dir.join(&project.path);
 
         // Check if this project has its own .meta file directly in its directory
-        let has_meta = project_dir.is_dir()
-            && find_meta_config(&project_dir, None)
-                .map(|(path, _)| path.parent().map(|p| p == project_dir).unwrap_or(false))
-                .unwrap_or(false);
-
-        // Recurse into children if within depth limit and this is a meta repo
-        let children = if has_meta && current_depth < max_depth {
-            let canonical = project_dir.canonicalize().unwrap_or(project_dir.clone());
-            if visited.insert(canonical) {
-                if let Some((nested_config_path, _)) = find_meta_config(&project_dir, None) {
-                    if let Ok((nested_projects, _)) = parse_meta_config(&nested_config_path) {
-                        walk_inner(
-                            &project_dir,
-                            &nested_projects,
-                            max_depth,
-                            current_depth + 1,
-                            visited,
-                        )
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![] // Cycle detected
-            }
+        let nested_config = if project_dir.is_dir() {
+            find_meta_config(&project_dir, None)
+                .filter(|(path, _)| path.parent() == Some(project_dir.as_path()))
         } else {
-            vec![]
+            None
         };
+        let has_meta = nested_config.is_some();
+
+        // Recurse into children if within depth limit and this is a meta repo.
+        // A nested config that fails to parse or validate is an error, not an
+        // empty subtree: skipping it would silently drop its repos.
+        let mut children = vec![];
+        if let Some((nested_config_path, _)) = nested_config {
+            let canonical = project_dir.canonicalize().unwrap_or(project_dir.clone());
+            // `visited` stops cycles through symlinks
+            if current_depth < max_depth && visited.insert(canonical) {
+                let (nested_projects, _) = parse_meta_config(&nested_config_path)?;
+                children = walk_inner(
+                    &project_dir,
+                    &nested_projects,
+                    max_depth,
+                    current_depth + 1,
+                    visited,
+                )?;
+            }
+        }
 
         nodes.push(MetaTreeNode {
             info: project.clone(),
@@ -464,7 +577,7 @@ fn walk_inner(
     }
 
     nodes.sort_by(|a, b| a.info.name.cmp(&b.info.name));
-    nodes
+    Ok(nodes)
 }
 
 #[cfg(test)]
@@ -563,10 +676,11 @@ mod tests {
         let child = dir.path().join("child");
         std::fs::create_dir(&child).unwrap();
 
-        // Create a symlink from child/loop back to root
+        // Create a symlink from child/loop back to child itself (a link to an
+        // ancestor would leave child's directory and be rejected outright)
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(dir.path(), child.join("loop")).unwrap();
+            std::os::unix::fs::symlink(&child, child.join("loop")).unwrap();
         }
 
         std::fs::write(
@@ -1030,32 +1144,139 @@ mod tests {
     }
 
     #[test]
-    fn test_walk_meta_tree_handles_malformed_nested_meta() {
-        // When a nested .meta file is malformed, we should skip it gracefully
+    fn test_walk_meta_tree_fails_on_malformed_nested_meta() {
+        // A broken nested .meta must surface, not silently drop its repos
         let dir = tempfile::tempdir().unwrap();
         let vendor = dir.path().join("vendor");
         std::fs::create_dir(&vendor).unwrap();
-
-        // Root .meta is valid
         std::fs::write(
             dir.path().join(".meta"),
             r#"{"projects": {"vendor": {"repo": "git@github.com:org/vendor.git", "meta": true}}}"#,
         )
         .unwrap();
-
-        // Nested .meta is malformed JSON
         std::fs::write(
             vendor.join(".meta"),
-            r#"{"projects": {this is not valid json}"#,
+            r#"{"projects": {"x": {"path": "../../escape"}}}"#,
         )
         .unwrap();
 
-        // Should still return the tree without the nested children
-        let tree = walk_meta_tree(dir.path(), None).unwrap();
-        assert_eq!(tree.len(), 1);
-        assert_eq!(tree[0].info.name, "vendor");
-        // Children should be empty because the nested .meta was malformed
-        assert_eq!(tree[0].children.len(), 0);
+        let err = walk_meta_tree(dir.path(), None).unwrap_err().to_string();
+        assert!(err.contains("Invalid project 'x'"), "{err}");
+        assert!(err.contains("vendor"), "{err}");
+    }
+
+    fn parse_err(json: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".meta"), json).unwrap();
+        parse_meta_config(&dir.path().join(".meta"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn test_parse_rejects_paths_outside_the_workspace() {
+        for path in [
+            "../../dropped",
+            "a/../../b",
+            "/abs/dir",
+            "C:/x",
+            "C:x",
+            "\\\\host\\s",
+            ".",
+            "./",
+        ] {
+            let err = parse_err(&format!(
+                r#"{{"projects": {{"p": {{"repo": "u", "path": {path:?}}}}}}}"#
+            ));
+            assert!(err.contains("Invalid project 'p' in "), "{path}: {err}");
+            assert!(err.contains(".meta: path"), "{path}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_bad_names_tags_and_repos() {
+        for (json, what) in [
+            (
+                r#"{"projects": {"../../../../escaped-wt": {"repo": "u", "path": "a"}}}"#,
+                "single path component",
+            ),
+            (r#"{"projects": {"a/b": "u"}}"#, "single path component"),
+            (
+                r#"{"projects": {"..": {"repo": "u", "path": "a"}}}"#,
+                "single path component",
+            ),
+            (
+                r#"{"projects": {"x\u001b]0;T\u0007": "u"}}"#,
+                "control characters",
+            ),
+            (
+                r#"{"projects": {"a": {"repo": "u", "tags": ["n\nfake"]}}}"#,
+                "control characters",
+            ),
+            (
+                r#"{"projects": {"a": {"repo": "u", "tags": ["a,b"]}}}"#,
+                "whitespace or ','",
+            ),
+            (
+                r#"{"projects": {"a": {"repo": "u", "tags": [""]}}}"#,
+                "tag is empty",
+            ),
+            (
+                r#"{"projects": {"a": "--upload-pack=touch x"}}"#,
+                "must not start with '-'",
+            ),
+            (
+                r#"{"projects": {"a": {"repo": "u", "path": "t\u001b[2J"}}}"#,
+                "control characters",
+            ),
+        ] {
+            let err = parse_err(json);
+            assert!(err.contains(what), "{json}: {err}");
+            // The offending value is escaped in the message itself
+            assert!(!err.contains('\u{1b}'), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_normalizes_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"a": {"repo": "u", "path": "./third_party//vendor/"}, "b": {"repo": "u", "path": "x\\y"}}}"#,
+        )
+        .unwrap();
+        let (projects, _) = parse_meta_config(&dir.path().join(".meta")).unwrap();
+        assert_eq!(projects[0].path, "third_party/vendor");
+        assert_eq!(projects[1].path, "x/y");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("inside")).unwrap();
+        let meta = dir.path().join(".meta");
+
+        for path in ["link", "link/sub"] {
+            std::fs::write(
+                &meta,
+                format!(r#"{{"projects": {{"p": {{"repo": "u", "path": "{path}"}}}}}}"#),
+            )
+            .unwrap();
+            let err = parse_meta_config(&meta).unwrap_err().to_string();
+            assert!(err.contains("through the symlink"), "{path}: {err}");
+        }
+
+        // A symlink that stays inside the workspace is fine
+        std::fs::write(
+            &meta,
+            r#"{"projects": {"p": {"repo": "u", "path": "inside/sub"}}}"#,
+        )
+        .unwrap();
+        assert!(parse_meta_config(&meta).is_ok());
     }
 
     #[test]

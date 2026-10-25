@@ -1,25 +1,26 @@
-//! File-based locking with PID staleness detection and retry.
+//! Exclusive locks for the `~/.meta/` stores.
 //!
-//! Uses `O_CREAT | O_EXCL` semantics for atomic lock creation.
-//! Writes the current PID into the lock file for stale lock detection.
-//! Provides a RAII guard that releases the lock on drop.
+//! The lock is an OS file lock (`flock` on Unix, `LockFileEx` on Windows) held
+//! on an open lock file. The OS releases it when the holder exits, crashes or
+//! is killed, so there is no stale state to detect or recover: a leftover lock
+//! file, empty or holding a PID from an older meta, is just a file and gets
+//! locked again. The file is never deleted, so two processes racing can never
+//! end up holding locks on two different files at the same path.
+//!
+//! On Unix the lock's directory must belong to the current user and must not
+//! be writable by group or others; anyone else who could write there could
+//! replace the lock file or the store beside it.
 
 use anyhow::{Context, Result};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// RAII guard that releases the lock file on drop.
+/// RAII guard that holds the lock until dropped.
 pub struct LockGuard {
+    _file: File,
     path: PathBuf,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
 }
 
 impl LockGuard {
@@ -29,167 +30,65 @@ impl LockGuard {
     }
 }
 
-/// Acquire an exclusive lock at the given path.
+/// Acquire an exclusive lock on `lock_path`, creating the file and its
+/// directory if needed.
 ///
-/// Creates the lock file with `O_CREAT | O_EXCL` and writes the current PID.
-/// If the lock file already exists:
-/// 1. Check if the PID inside is still alive (stale lock detection)
-/// 2. If stale, remove and retry
-/// 3. If alive, wait `retry_ms` milliseconds and retry up to `max_retries` times
-///
-/// Returns a `LockGuard` that removes the lock file on drop.
-pub fn acquire(lock_path: &Path, max_retries: u32, retry_ms: u64) -> Result<LockGuard> {
-    // Ensure parent directory exists
+/// Waits up to `timeout` while another process holds the lock, then fails.
+pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
     if let Some(parent) = lock_path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create lock directory: {}", parent.display())
-            })?;
-        }
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create lock directory: {}", parent.display()))?;
+        crate::data_dir::check_private_dir(parent)?;
     }
-
-    for attempt in 0..=max_retries {
-        match try_create_lock(lock_path) {
-            Ok(guard) => return Ok(guard),
-            Err(_) if attempt < max_retries => {
-                // Lock exists — check if stale
-                if let Some(stale_pid) = stale_pid(lock_path) {
-                    // Double-check: re-read PID to guard against race where
-                    // another process acquired the lock between our checks
-                    if read_lock_pid(lock_path) == Some(stale_pid) {
-                        let _ = fs::remove_file(lock_path);
-                    }
-                    continue;
-                }
-                // Lock is held by a live process — wait and retry
-                thread::sleep(Duration::from_millis(retry_ms));
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to acquire lock at {} after {} attempts",
-                        lock_path.display(),
-                        max_retries + 1
-                    )
-                });
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "Failed to acquire lock at {} after {} retries",
-        lock_path.display(),
-        max_retries
-    )
-}
-
-/// Try to create the lock file atomically.
-fn try_create_lock(lock_path: &Path) -> Result<LockGuard> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true) // O_CREAT | O_EXCL
+        .create(true)
+        .truncate(false)
         .open(lock_path)
-        .with_context(|| format!("Lock file already exists: {}", lock_path.display()))?;
+        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
 
-    // Write current PID
-    let pid = std::process::id();
-    writeln!(file, "{pid}")
-        .with_context(|| format!("Failed to write PID to lock file: {}", lock_path.display()))?;
-
-    Ok(LockGuard {
-        path: lock_path.to_path_buf(),
-    })
-}
-
-/// Check if a lock file is stale (the PID inside is dead).
-///
-/// Returns `true` if:
-/// - The lock file doesn't exist
-/// - The lock file can't be read
-/// - The PID in the lock file is not a running process
-pub fn is_stale(lock_path: &Path) -> bool {
-    stale_pid(lock_path).is_some()
-}
-
-/// Read the PID from a lock file, returning None if unreadable or unparseable.
-fn read_lock_pid(lock_path: &Path) -> Option<u32> {
-    let content = fs::read_to_string(lock_path).ok()?;
-    content.trim().parse().ok()
-}
-
-/// If the lock is stale, return the dead PID. Otherwise return None.
-fn stale_pid(lock_path: &Path) -> Option<u32> {
-    let pid = read_lock_pid(lock_path)?;
-    if is_process_alive(pid) {
-        None
-    } else {
-        Some(pid)
-    }
-}
-
-/// Check if a process with the given PID is alive.
-#[cfg(unix)]
-fn is_process_alive(pid: u32) -> bool {
-    // kill(pid, 0) checks if process exists without sending a signal
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-#[cfg(windows)]
-fn is_process_alive(pid: u32) -> bool {
-    use std::ptr::null_mut;
-
-    // PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn OpenProcess(
-            dwDesiredAccess: u32,
-            bInheritHandle: i32,
-            dwProcessId: u32,
-        ) -> *mut std::ffi::c_void;
-        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-    }
-
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            false
-        } else {
-            CloseHandle(handle);
-            true
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                return Ok(LockGuard {
+                    _file: file,
+                    path: lock_path.to_path_buf(),
+                })
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(TryLockError::WouldBlock) => anyhow::bail!(
+                "Timed out after {:?} waiting for the lock at {}: another meta process holds it",
+                timeout,
+                lock_path.display()
+            ),
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("Failed to lock {}", lock_path.display()))
+            }
         }
     }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn is_process_alive(_pid: u32) -> bool {
-    // On other platforms, conservatively assume the process is alive
-    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const WAIT: Duration = Duration::from_millis(200);
+
     #[test]
     fn test_acquire_and_release() {
         let tmp = tempfile::tempdir().unwrap();
         let lock_path = tmp.path().join("test.lock");
 
-        {
-            let guard = acquire(&lock_path, 0, 100).unwrap();
-            assert!(lock_path.exists());
-            assert_eq!(guard.path(), lock_path);
+        let guard = acquire(&lock_path, WAIT).unwrap();
+        assert_eq!(guard.path(), lock_path);
+        drop(guard);
 
-            // Verify PID was written
-            let content = fs::read_to_string(&lock_path).unwrap();
-            let pid: u32 = content.trim().parse().unwrap();
-            assert_eq!(pid, std::process::id());
-        }
-
-        // Guard dropped — lock should be removed
-        assert!(!lock_path.exists());
+        // Released on drop: the next acquire succeeds at once
+        acquire(&lock_path, Duration::ZERO).unwrap();
     }
 
     #[test]
@@ -197,39 +96,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let lock_path = tmp.path().join("test.lock");
 
-        let _guard = acquire(&lock_path, 0, 100).unwrap();
-
-        // Second acquire should fail (0 retries)
-        let result = acquire(&lock_path, 0, 10);
-        assert!(result.is_err());
+        let _guard = acquire(&lock_path, WAIT).unwrap();
+        let err = acquire(&lock_path, WAIT).err().unwrap().to_string();
+        assert!(err.contains("another meta process holds it"), "{err}");
     }
 
     #[test]
-    fn test_stale_lock_detection() {
+    fn test_leftover_lock_files_do_not_block() {
         let tmp = tempfile::tempdir().unwrap();
         let lock_path = tmp.path().join("stale.lock");
 
-        // Write a fake PID that definitely doesn't exist
-        fs::write(&lock_path, "999999999\n").unwrap();
-
-        assert!(is_stale(&lock_path));
-
-        // Write our own PID — should not be stale
-        fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
-        assert!(!is_stale(&lock_path));
+        // Empty (crash between create and write), garbage, a dead PID, and a
+        // live but unrelated PID (our own, standing in for PID reuse)
+        let own_pid = format!("{}\n", std::process::id());
+        for content in ["", "not a pid", "999999999\n", own_pid.as_str()] {
+            fs::write(&lock_path, content).unwrap();
+            acquire(&lock_path, Duration::ZERO).unwrap();
+        }
     }
 
     #[test]
-    fn test_acquire_recovers_stale_lock() {
+    fn test_lock_excludes_other_processes() {
+        // The lock belongs to the open file, so a second open (as another
+        // process would make) sees it held.
         let tmp = tempfile::tempdir().unwrap();
-        let lock_path = tmp.path().join("stale.lock");
+        let lock_path = tmp.path().join("x.lock");
+        let _guard = acquire(&lock_path, WAIT).unwrap();
 
-        // Create a stale lock (non-existent PID)
-        fs::write(&lock_path, "999999999\n").unwrap();
-
-        // Should succeed by detecting and removing the stale lock
-        let guard = acquire(&lock_path, 1, 10).unwrap();
-        assert!(lock_path.exists());
-        drop(guard);
+        let other = File::options().write(true).open(&lock_path).unwrap();
+        assert!(matches!(other.try_lock(), Err(TryLockError::WouldBlock)));
     }
 }
