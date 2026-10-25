@@ -22,6 +22,7 @@ const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 
+const FILE_READ_DATA: u32 = 0x1;
 const FILE_ADD_FILE: u32 = 0x2;
 const FILE_ADD_SUBDIRECTORY: u32 = 0x4;
 const FILE_DELETE_CHILD: u32 = 0x40;
@@ -30,6 +31,7 @@ const WRITE_DAC: u32 = 0x4_0000;
 const WRITE_OWNER: u32 = 0x8_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_READ: u32 = 0x8000_0000;
 
 /// Rights on the data directory itself that would let an account change
 /// what it holds, or who may.
@@ -45,6 +47,10 @@ pub const DIR_RIGHTS: u32 = FILE_ADD_FILE
 /// Rights on a directory above it that would let an account rename or
 /// replace what it holds, or change who may.
 pub const ANCESTOR_RIGHTS: u32 = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
+
+/// Rights that let an account open the files in a directory (their access
+/// lists inherit from it), and so hold a lock on one.
+pub const READ_RIGHTS: u32 = FILE_READ_DATA | GENERIC_READ | GENERIC_ALL;
 
 /// SYSTEM, Administrators and TrustedInstaller, which can change anything anyway.
 const SYSTEM_SIDS: [&str; 3] = [
@@ -80,10 +86,10 @@ pub fn current_user_sid() -> Result<String> {
     }
 }
 
-/// Why an account other than `user` and the system's own could change
+/// Why an account other than `user` and the system's own could `verb`
 /// `dir`, if one could: it owns `dir`, there is no access list, or an entry
 /// that applies to `dir` grants it any of `rights`.
-pub fn untrusted_access(dir: &Path, user: &str, rights: u32) -> Result<Option<String>> {
+pub fn untrusted_access(dir: &Path, user: &str, rights: u32, verb: &str) -> Result<Option<String>> {
     let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
     let trusted = |sid: &str| sid == user || SYSTEM_SIDS.contains(&sid);
     // SAFETY: GetNamedSecurityInfoW fills `owner` and `dacl` with pointers
@@ -145,7 +151,7 @@ pub fn untrusted_access(dir: &Path, user: &str, rights: u32) -> Result<Option<St
                 }
                 let sid = sid_string(std::ptr::addr_of!(allowed.SidStart).cast_mut().cast())?;
                 if !trusted(&sid) {
-                    return Ok(Some(format!("{sid} may change it")));
+                    return Ok(Some(format!("{sid} may {verb} it")));
                 }
             }
             Ok(None)

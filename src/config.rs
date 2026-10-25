@@ -255,9 +255,9 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 /// - No value (name, path, repo, tags, provides, depends_on) is empty or holds
 ///   a control or bidirectional-control character ([`is_unsafe_char`]).
 /// - `name` is one path component: not `.` or `..`, no `/` or `\`.
-/// - Neither the name nor any path component means something else on
-///   Windows ([`windows_ambiguity`]): no drive prefix, `<>:"|?*`, trailing
-///   dot or space, `~` and digit, or device name.
+/// - The name and every path component pass [`component_problem`]: ASCII
+///   letters, digits, space and `._-+@` only, no trailing dot or space, no
+///   Windows device name, not `.git`. The first component is not `.worktrees`.
 /// - `path` (the name when omitted) is relative and stays inside the config's
 ///   directory: `\` reads as `/`, empty and `.` components are dropped, `..`
 ///   is rejected, something must remain, and no symlink along it may lead
@@ -294,7 +294,7 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, 
     if matches!(info.name.as_str(), "." | "..") || info.name.contains(['/', '\\']) {
         return Err("name must be a single path component (no '/', '\\', '.' or '..')".into());
     }
-    if let Some(why) = windows_ambiguity(&info.name) {
+    if let Some(why) = component_problem(&info.name) {
         return Err(format!("name has {why}"));
     }
     if info.repo.as_deref().is_some_and(|r| r.starts_with('-')) {
@@ -348,28 +348,24 @@ fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
     Ok(())
 }
 
-/// What would make a name or path component mean something else on
-/// Windows, where the same `.meta` may be used: a drive prefix, a character
-/// Windows refuses or treats specially, a trailing dot or space (which
-/// Windows drops, so `a.` is `a`), a `~` and digit as in a short name like
-/// `PROGRA~1` (an alias of another name), or a device name like `NUL`.
-fn windows_ambiguity(part: &str) -> Option<&'static str> {
-    let mut chars = part.chars();
-    if matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic()) {
-        return Some("a drive prefix");
-    }
-    if part.contains(['<', '>', ':', '"', '|', '?', '*']) {
-        return Some("a character Windows does not allow (<>:\"|?*)");
+/// What is wrong with a name or path component, if anything. The same
+/// `.meta` serves every platform, so each must name one and the same
+/// directory everywhere:
+/// - only ASCII letters, digits, space and `._-+@`, which no filesystem
+///   folds, normalizes or treats specially (Unicode names can alias each
+///   other on macOS and Windows; `<>:"|?*` and `C:` mean something on Windows);
+/// - no trailing dot or space, which Windows drops (`a.` is `a` there);
+/// - not a Windows device name such as `NUL` or `COM1`;
+/// - not `.git`, which would put a repo inside a git directory (hooks).
+fn component_problem(part: &str) -> Option<&'static str> {
+    if !part
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '+' | '@'))
+    {
+        return Some("a character other than ASCII letters, digits, space and ._-+@");
     }
     if part.ends_with(['.', ' ']) {
         return Some("a trailing dot or space, which Windows drops");
-    }
-    let short_name = part.match_indices('~').any(|(i, _)| {
-        part.get(i + 1..)
-            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
-    });
-    if short_name {
-        return Some("a '~' and digit, as in a Windows short name");
     }
     let stem = part
         .split('.')
@@ -384,6 +380,9 @@ fn windows_ambiguity(part: &str) -> Option<&'static str> {
     if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT")
     {
         return Some("a Windows device name");
+    }
+    if part.eq_ignore_ascii_case(".git") {
+        return Some("the name .git");
     }
     None
 }
@@ -400,7 +399,7 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
         match part {
             "" | "." => {}
             ".." => return Err(format!("path '{raw}' must not contain '..'")),
-            part => match windows_ambiguity(part) {
+            part => match component_problem(part) {
                 Some(why) => return Err(format!("path '{raw}' has a component with {why}")),
                 None => parts.push(part),
             },
@@ -409,6 +408,14 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
     if parts.is_empty() {
         return Err(format!(
             "path '{raw}' must name a directory below the .meta file"
+        ));
+    }
+    if parts
+        .first()
+        .is_some_and(|first| first.eq_ignore_ascii_case(".worktrees"))
+    {
+        return Err(format!(
+            "path '{raw}' is inside .worktrees, where worktrees live"
         ));
     }
     Ok(parts.join("/"))
@@ -1430,12 +1437,12 @@ mod tests {
             r#"{"projects": {"C:outside": {"repo": "u", "path": "safe"}}}"#,
         ] {
             let err = parse_err(json);
-            assert!(err.contains("drive prefix"), "{json}: {err}");
+            assert!(err.contains("ASCII letters"), "{json}: {err}");
         }
     }
 
     #[test]
-    fn test_parse_rejects_names_and_paths_windows_reads_differently() {
+    fn test_parse_rejects_names_and_paths_that_alias_or_mislead() {
         for (json, what) in [
             (
                 r#"{"projects": {"p": {"repo": "u", "path": "a./x"}}}"#,
@@ -1444,10 +1451,6 @@ mod tests {
             (
                 r#"{"projects": {"p": {"repo": "u", "path": "a /x"}}}"#,
                 "trailing dot or space",
-            ),
-            (
-                r#"{"projects": {"p": {"repo": "u", "path": "PROGRA~1/x"}}}"#,
-                "short name",
             ),
             (
                 r#"{"projects": {"p": {"repo": "u", "path": "x/nul"}}}"#,
@@ -1462,10 +1465,42 @@ mod tests {
                 "device name",
             ),
             (
-                r#"{"projects": {"p": {"repo": "u", "path": "ab:c"}}}"#,
-                "does not allow",
+                r#"{"projects": {"p": {"repo": "u", "path": "C:x"}}}"#,
+                "ASCII letters",
             ),
-            (r#"{"projects": {"x|y": "u"}}"#, "does not allow"),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "ab:c"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "PROGRA~1/x"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "caf\u00e9"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "cafe\u0301"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "COM\u00b9"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": ".git/hooks"}}}"#,
+                "the name .git",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "x/.GIT/hooks"}}}"#,
+                "the name .git",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": ".worktrees/t"}}}"#,
+                "inside .worktrees",
+            ),
+            (r#"{"projects": {"x|y": "u"}}"#, "ASCII letters"),
             (
                 r#"{"projects": {"a.": {"repo": "u", "path": "b"}}}"#,
                 "trailing dot",
@@ -1478,7 +1513,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".meta"),
-            r#"{"projects": {"console": "u", "a.b": "u", "com10": "u", "x~y": "u", "lpt": "u"}}"#,
+            r#"{"projects": {"console": "u", "a.b": "u", "com10": "u", "x y+z@w": "u", ".github": "u"}}"#,
         )
         .unwrap();
         assert!(parse_meta_config(&dir.path().join(".meta")).is_ok());

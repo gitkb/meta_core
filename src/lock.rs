@@ -39,6 +39,20 @@ impl LockGuard {
 pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
     if let Some(parent) = lock_path.parent() {
         crate::data_dir::create_private_dir(parent)?;
+        // Anyone who can open the lock file can hold the lock; on Unix the
+        // file is made 0600 below, on Windows it inherits the directory's
+        // access list
+        #[cfg(windows)]
+        {
+            use crate::win_acl::{current_user_sid, untrusted_access, READ_RIGHTS};
+            let user = current_user_sid()?;
+            if let Some(why) = untrusted_access(parent, &user, READ_RIGHTS, "open files in")? {
+                anyhow::bail!(
+                    "Refusing to lock in {}: {why}, so another account could hold the lock",
+                    escape_path(parent)
+                );
+            }
+        }
     }
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);

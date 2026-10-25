@@ -115,7 +115,10 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
         // leaving a directory through `..` depends on it as much as entering
         // one of its entries does
         let holder = stat(&current)?;
-        if !owned_by_you_or_root(&holder, uid) || !only_you_can_write(&holder, true) {
+        if !owned_by_you_or_root(&holder, uid)
+            || !only_you_can_write(&holder, true)
+            || acl_allows_others(&current)
+        {
             anyhow::bail!(
                 "Refusing to use {shown}: another user could replace it through {} \
                  (it must belong to you or root and not be writable by others){}",
@@ -163,6 +166,12 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
             "Refusing to use {shown}: other users can write to it (fix with: chmod go-w '{shown}')"
         );
     }
+    if acl_allows_others(&current) {
+        anyhow::bail!(
+            "Refusing to use {shown}: its access control list grants access beyond the mode \
+             bits (see: ls -led '{shown}'; remove with: chmod -N '{shown}')"
+        );
+    }
     Ok(())
 }
 
@@ -181,6 +190,58 @@ fn owned_by_you_or_root(meta: &std::fs::Metadata, uid: u32) -> bool {
 fn only_you_can_write(meta: &std::fs::Metadata, sticky_ok: bool) -> bool {
     use std::os::unix::fs::MetadataExt;
     meta.mode() & 0o022 == 0 || (sticky_ok && meta.mode() & 0o1000 != 0)
+}
+
+/// Whether a macOS access control list on `path` has an allow entry, which
+/// can grant write access that the mode bits do not show. (Deny entries,
+/// like the one macOS puts on home folders, only take access away.) On Linux
+/// an ACL cannot grant more than the group bits allow, so the mode check
+/// covers it.
+#[cfg(target_os = "macos")]
+fn acl_allows_others(path: &Path) -> bool {
+    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    const ACL_TYPE_EXTENDED: c_int = 0x100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: c_int = 1;
+    extern "C" {
+        fn acl_get_link_np(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
+        fn acl_free(obj: *mut c_void) -> c_int;
+    }
+
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: the ACL is freed once; entries point into it and are not used
+    // after that.
+    unsafe {
+        let acl = acl_get_link_np(c_path.as_ptr(), ACL_TYPE_EXTENDED);
+        if acl.is_null() {
+            return false; // no ACL
+        }
+        let mut allows = false;
+        let mut entry: *mut c_void = std::ptr::null_mut();
+        let mut which = ACL_FIRST_ENTRY;
+        while acl_get_entry(acl, which, &mut entry) == 0 {
+            which = ACL_NEXT_ENTRY;
+            let mut tag: c_int = 0;
+            if acl_get_tag_type(entry, &mut tag) != 0 || tag == ACL_EXTENDED_ALLOW {
+                allows = true;
+                break;
+            }
+        }
+        acl_free(acl);
+        allows
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn acl_allows_others(_path: &Path) -> bool {
+    false
 }
 
 /// In a user namespace that maps only you (some sandboxes), files of every
@@ -214,7 +275,7 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
     let mut holder: Option<&Path> = None;
     for path in ancestors {
         if let Some(holder) = holder {
-            if let Some(why) = untrusted_access(holder, &user, ANCESTOR_RIGHTS)? {
+            if let Some(why) = untrusted_access(holder, &user, ANCESTOR_RIGHTS, "change")? {
                 anyhow::bail!(
                     "Refusing to use {shown}: another user could replace it through {} ({why})",
                     crate::display::escape_path(holder)
@@ -231,8 +292,11 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
         }
         holder = Some(path);
     }
-    if let Some(why) = untrusted_access(&written, &user, DIR_RIGHTS)? {
-        anyhow::bail!("Refusing to use {shown}: {why}");
+    if let Some(why) = untrusted_access(&written, &user, DIR_RIGHTS, "change")? {
+        anyhow::bail!(
+            "Refusing to use {shown}: {why} (remove other accounts' write access, for \
+             example with icacls, or use a directory in your profile)"
+        );
     }
     Ok(())
 }
@@ -357,6 +421,39 @@ mod tests {
         check_private_dir(&private).unwrap();
         let err = check_private_dir(&junction).unwrap_err().to_string();
         assert!(err.contains("is a link or junction"), "{err}");
+
+        // A lock in a directory others can read is refused: they could hold it
+        let readable = tmp.path().join("readable");
+        std::fs::create_dir(&readable).unwrap();
+        crate::lock::acquire(&readable.join("x.lock"), std::time::Duration::ZERO).unwrap();
+        let granted = std::process::Command::new("icacls")
+            .arg(&readable)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .status()
+            .unwrap();
+        assert!(granted.success());
+        let err = crate::lock::acquire(&readable.join("x.lock"), std::time::Duration::ZERO)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("could hold the lock"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_refuses_an_acl_that_allows_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("acl");
+        std::fs::create_dir(&dir).unwrap();
+        check_private_dir(&dir).unwrap();
+        let added = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow add_file,delete_child"])
+            .arg(&dir)
+            .status()
+            .unwrap();
+        assert!(added.success());
+        let err = check_private_dir(&dir).unwrap_err().to_string();
+        assert!(err.contains("access control list"), "{err}");
     }
 
     #[cfg(unix)]
