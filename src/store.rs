@@ -4,6 +4,7 @@
 //! with atomic write semantics (write to `.tmp`, then rename) and optional
 //! lock protection for concurrent access.
 
+use crate::display::escape_path;
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -18,14 +19,14 @@ pub fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     }
 
     let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read store file: {}", path.display()))?;
+        .with_context(|| format!("Failed to read store file: {}", escape_path(path)))?;
 
     if content.trim().is_empty() {
         return Ok(T::default());
     }
 
     serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse store file: {}", path.display()))
+        .with_context(|| format!("Failed to parse store file: {}", escape_path(path)))
 }
 
 /// Write data to a JSON file atomically.
@@ -37,7 +38,7 @@ pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+                .with_context(|| format!("Failed to create directory: {}", escape_path(parent)))?;
         }
     }
 
@@ -47,10 +48,10 @@ pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
         serde_json::to_string_pretty(data).with_context(|| "Failed to serialize store data")?;
 
     std::fs::write(&tmp_path, &json)
-        .with_context(|| format!("Failed to write temp file: {}", tmp_path.display()))?;
+        .with_context(|| format!("Failed to write temp file: {}", escape_path(&tmp_path)))?;
 
     std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("Failed to rename temp file to: {}", path.display()))?;
+        .with_context(|| format!("Failed to rename temp file to: {}", escape_path(path)))?;
 
     Ok(())
 }

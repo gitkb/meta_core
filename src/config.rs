@@ -167,17 +167,29 @@ pub fn find_meta_config(
 /// share or nest paths ([`check_no_overlap`]); a bad entry fails the parse
 /// with the file and project named.
 pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, Vec<String>)> {
-    let config_str = std::fs::read_to_string(meta_path)
-        .with_context(|| format!("Failed to read meta config file: '{}'", meta_path.display()))?;
+    let config_str = std::fs::read_to_string(meta_path).with_context(|| {
+        format!(
+            "Failed to read meta config file: '{}'",
+            escape_path(meta_path)
+        )
+    })?;
 
     // Determine format from file extension
     let path_str = meta_path.to_string_lossy();
     let config: MetaConfig = if path_str.ends_with(".yaml") || path_str.ends_with(".yml") {
-        serde_yaml_ng::from_str(&config_str)
-            .with_context(|| format!("Failed to parse YAML config file: {}", meta_path.display()))?
+        serde_yaml_ng::from_str(&config_str).with_context(|| {
+            format!(
+                "Failed to parse YAML config file: {}",
+                escape_path(meta_path)
+            )
+        })?
     } else {
-        serde_json::from_str(&config_str)
-            .with_context(|| format!("Failed to parse JSON config file: {}", meta_path.display()))?
+        serde_json::from_str(&config_str).with_context(|| {
+            format!(
+                "Failed to parse JSON config file: {}",
+                escape_path(meta_path)
+            )
+        })?
     };
 
     // Convert project entries to normalized, validated ProjectInfo
@@ -370,7 +382,7 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
 }
 
 /// Resolve `rel` below `base_dir` through the symlinks that exist now, and
-/// refuse it if one leads outside `base_dir` or if it is `base_dir` itself.
+/// refuse it if one leads outside `base_dir` or if it ends at `base_dir`.
 /// Returns the project's location: the real path of the part that exists,
 /// followed by the part not created yet.
 fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
@@ -387,7 +399,7 @@ fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
         match current.symlink_metadata() {
             Err(_) => exists = false,
             Ok(meta) if meta.file_type().is_symlink() => match current.canonicalize() {
-                Ok(target) if target.starts_with(&base) && target != base => current = target,
+                Ok(target) if target.starts_with(&base) => current = target,
                 _ => {
                     return Err(format!(
                         "path '{rel}' leads outside {} through the symlink '{}'",
@@ -398,6 +410,11 @@ fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
             },
             Ok(_) => {}
         }
+    }
+    if current == base {
+        return Err(format!(
+            "path '{rel}' leads to the directory of the .meta file itself"
+        ));
     }
     Ok(current)
 }
@@ -450,7 +467,7 @@ pub fn walk_meta_tree(
     max_depth: Option<usize>,
 ) -> anyhow::Result<Vec<MetaTreeNode>> {
     let (config_path, _format) = find_meta_config(start_dir, None)
-        .ok_or_else(|| anyhow::anyhow!("No .meta config found in {}", start_dir.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("No .meta config found in {}", escape_path(start_dir)))?;
 
     let (projects, _ignore) = parse_meta_config(&config_path)?;
     let meta_dir = config_path.parent().unwrap_or(Path::new("."));
@@ -761,7 +778,10 @@ mod tests {
         #[cfg(unix)]
         {
             let err = walk_meta_tree(dir.path(), None).unwrap_err().to_string();
-            assert!(err.contains("through the symlink"), "{err}");
+            assert!(
+                err.contains("leads to the directory of the .meta file itself"),
+                "{err}"
+            );
         }
     }
 
@@ -1320,6 +1340,44 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_allows_symlink_alias_of_the_workspace_itself() {
+        // `here -> .` is harmless as a step on the way; only ending at the
+        // config's own directory is refused
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("here")).unwrap();
+        let meta = dir.path().join(".meta");
+        std::fs::write(
+            &meta,
+            r#"{"projects": {"svc": {"repo": "u", "path": "here/service"}}}"#,
+        )
+        .unwrap();
+        assert!(parse_meta_config(&meta).is_ok());
+
+        std::fs::write(
+            &meta,
+            r#"{"projects": {"svc": {"repo": "u", "path": "here"}}}"#,
+        )
+        .unwrap();
+        let err = parse_meta_config(&meta).unwrap_err().to_string();
+        assert!(
+            err.contains("leads to the directory of the .meta file itself"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_config_errors_escape_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws\nfake line\u{1b}[2J");
+        std::fs::create_dir(&ws).unwrap();
+        std::fs::write(ws.join(".meta"), "{not json").unwrap();
+        let err = format!("{:#}", parse_meta_config(&ws.join(".meta")).unwrap_err());
+        assert!(!err.contains('\n') && !err.contains('\u{1b}'), "{err}");
+        assert!(err.contains("ws\\nfake line\\u{1b}[2J"), "{err}");
     }
 
     #[test]

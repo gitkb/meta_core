@@ -69,7 +69,8 @@ fn create_private_dir(dir: &Path) -> Result<()> {
 /// through each symlink it follows, since another user who can rename entries
 /// in one of them could swap what the path leads to. Each such directory must
 /// belong to you or root and be writable by no one else, unless it is sticky
-/// like `/tmp` (then only an entry's owner can rename it).
+/// like `/tmp` (then only an entry's owner can rename it), and every symlink
+/// followed must belong to you or root.
 #[cfg(unix)]
 pub fn check_private_dir(dir: &Path) -> Result<()> {
     use std::ffi::OsString;
@@ -120,7 +121,15 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
             );
         }
         let next = current.join(&name);
-        if stat(&next)?.file_type().is_symlink() {
+        let entry = stat(&next)?;
+        if entry.file_type().is_symlink() {
+            // In a sticky directory the link's owner can still replace it
+            if entry.uid() != uid && entry.uid() != 0 {
+                anyhow::bail!(
+                    "Refusing to use {shown}: the symlink {} belongs to another user",
+                    crate::display::escape_path(&next)
+                );
+            }
             hops += 1;
             anyhow::ensure!(hops <= 40, "Failed to check {shown}: too many symlinks");
             let target = std::fs::read_link(&next)
