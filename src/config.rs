@@ -1369,6 +1369,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // Windows refuses control characters in file names
     #[test]
     fn test_config_errors_escape_the_path() {
         let dir = tempfile::tempdir().unwrap();

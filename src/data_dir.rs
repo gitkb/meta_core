@@ -108,10 +108,9 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
     let mut current = PathBuf::from("/");
     let mut hops = 0;
     while let Some(name) = pending.pop() {
-        if name == ".." {
-            current.pop();
-            continue;
-        }
+        // Check the directory we are in before any step, `..` included:
+        // leaving a directory through `..` depends on it as much as entering
+        // one of its entries does
         let holder = stat(&current)?;
         let sticky = holder.mode() & 0o1000 != 0;
         if (holder.uid() != uid && holder.uid() != 0) || (holder.mode() & 0o022 != 0 && !sticky) {
@@ -119,6 +118,10 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
                 "Refusing to use {shown}: another user could replace it through {}",
                 crate::display::escape_path(&current)
             );
+        }
+        if name == ".." {
+            current.pop();
+            continue;
         }
         let next = current.join(&name);
         let entry = stat(&next)?;
@@ -210,6 +213,12 @@ mod tests {
         check_private_dir(&link_home.join("meta")).unwrap();
         std::fs::set_permissions(&link_home, std::fs::Permissions::from_mode(0o777)).unwrap();
         let err = check_private_dir(&link_home.join("meta"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another user could replace it"), "{err}");
+
+        // `..` leaves a directory, which must be safe as well
+        let err = check_private_dir(&tmp.path().join("links/../shared/mine"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("another user could replace it"), "{err}");
