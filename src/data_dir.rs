@@ -298,9 +298,11 @@ pub(crate) fn acl_allows_others(path: &Path) -> bool {
     unsafe {
         let acl = acl_get_link_np(c_path.as_ptr(), ACL_TYPE_EXTENDED);
         if acl.is_null() {
-            // ENOENT means there is no ACL; anything else is not knowing,
-            // which is treated as an ACL that may let others in
-            return std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT);
+            // ENOENT means there is no ACL, and ENOTSUP a filesystem without
+            // ACLs; anything else is not knowing, which is treated as an ACL
+            // that may let others in
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            return errno != Some(libc::ENOENT) && errno != Some(libc::ENOTSUP);
         }
         let mut allows = false;
         let mut entry: *mut c_void = std::ptr::null_mut();
