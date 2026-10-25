@@ -74,7 +74,6 @@ pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
 #[cfg(unix)]
 pub fn check_private_dir(dir: &Path) -> Result<()> {
     use std::ffi::OsString;
-    use std::os::unix::fs::MetadataExt;
     use std::path::Component;
 
     let shown = crate::display::escape_path(dir);
@@ -116,12 +115,12 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
         // leaving a directory through `..` depends on it as much as entering
         // one of its entries does
         let holder = stat(&current)?;
-        let sticky = holder.mode() & 0o1000 != 0;
-        if (holder.uid() != uid && holder.uid() != 0) || (holder.mode() & 0o022 != 0 && !sticky) {
+        if !owned_by_you_or_root(&holder, uid) || !only_you_can_write(&holder, uid, true) {
             anyhow::bail!(
                 "Refusing to use {shown}: another user could replace it through {} \
-                 (it must belong to you or root and not be writable by others)",
-                crate::display::escape_path(&current)
+                 (it must belong to you or root and not be writable by others){}",
+                crate::display::escape_path(&current),
+                outside_namespace_note(&holder)
             );
         }
         if name == ".." {
@@ -132,10 +131,11 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
         let entry = stat(&next)?;
         if entry.file_type().is_symlink() {
             // In a sticky directory the link's owner can still replace it
-            if entry.uid() != uid && entry.uid() != 0 {
+            if !owned_by_you_or_root(&entry, uid) {
                 anyhow::bail!(
-                    "Refusing to use {shown}: the symlink {} belongs to another user",
-                    crate::display::escape_path(&next)
+                    "Refusing to use {shown}: the symlink {} belongs to another user{}",
+                    crate::display::escape_path(&next),
+                    outside_namespace_note(&entry)
                 );
             }
             hops += 1;
@@ -152,10 +152,13 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
     }
 
     let meta = stat(&current)?;
-    if !meta.is_dir() || meta.uid() != uid {
-        anyhow::bail!("Refusing to use {shown}: it is not a directory owned by you (uid {uid})");
+    if !meta.is_dir() || !owned_by_you_or_root(&meta, uid) {
+        anyhow::bail!(
+            "Refusing to use {shown}: it is not a directory owned by you (uid {uid}){}",
+            outside_namespace_note(&meta)
+        );
     }
-    if meta.mode() & 0o022 != 0 {
+    if !only_you_can_write(&meta, uid, false) {
         anyhow::bail!(
             "Refusing to use {shown}: other users can write to it (fix with: chmod go-w '{shown}')"
         );
@@ -163,29 +166,117 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn owned_by_you_or_root(meta: &std::fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.uid() == uid || meta.uid() == 0
+}
+
+/// No one but you (and root) can change the entries of this directory: it is
+/// not writable by others, or only for its group when that group is your own
+/// private group, or (when `sticky_ok`) it is sticky, so only an entry's
+/// owner can rename that entry.
+#[cfg(unix)]
+fn only_you_can_write(meta: &std::fs::Metadata, uid: u32, sticky_ok: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if sticky_ok && meta.mode() & 0o1000 != 0 {
+        return true;
+    }
+    meta.mode() & 0o002 == 0 && (meta.mode() & 0o020 == 0 || is_private_group(meta.gid(), uid))
+}
+
+/// Whether `gid` is the user's own private group, as on systems that give
+/// every user a group of their own (and umask 002): the user's primary
+/// group, named after the user, with no other members.
+#[cfg(unix)]
+fn is_private_group(gid: u32, uid: u32) -> bool {
+    use std::ffi::CStr;
+    use std::ptr::null_mut;
+
+    // SAFETY: the reentrant lookups write only into the structs and buffers
+    // passed in, and the strings read here point into those buffers.
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut found: *mut libc::passwd = null_mut();
+        let mut pw_buf = vec![0 as libc::c_char; 16 * 1024];
+        if libc::getpwuid_r(uid, &mut pwd, pw_buf.as_mut_ptr(), pw_buf.len(), &mut found) != 0
+            || found.is_null()
+            || pwd.pw_gid != gid
+        {
+            return false;
+        }
+        let user = CStr::from_ptr(pwd.pw_name);
+
+        let mut grp: libc::group = std::mem::zeroed();
+        let mut found: *mut libc::group = null_mut();
+        let mut gr_buf = vec![0 as libc::c_char; 64 * 1024];
+        if libc::getgrgid_r(gid, &mut grp, gr_buf.as_mut_ptr(), gr_buf.len(), &mut found) != 0
+            || found.is_null()
+            || CStr::from_ptr(grp.gr_name) != user
+        {
+            return false;
+        }
+        let mut member = grp.gr_mem;
+        while !member.is_null() && !(*member).is_null() {
+            if CStr::from_ptr(*member) != user {
+                return false;
+            }
+            member = member.add(1);
+        }
+        true
+    }
+}
+
+/// In a user namespace that maps only you (some sandboxes), files of every
+/// other account, root included, show as the overflow uid 65534.
+#[cfg(unix)]
+fn outside_namespace_note(meta: &std::fs::Metadata) -> &'static str {
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() == 65534 {
+        "; it shows as uid 65534, an account outside this user namespace, as inside \
+         some sandboxes, which meta cannot tell apart from another user"
+    } else {
+        ""
+    }
+}
+
 /// Refuse a directory that an account other than you, SYSTEM,
 /// Administrators or TrustedInstaller owns or may change, or that sits in a
-/// directory where such an account could rename or replace it.
+/// directory where such an account could rename or replace it. A link or
+/// junction on the way is refused too: whoever controls it could point it
+/// elsewhere after this check.
 #[cfg(windows)]
 pub fn check_private_dir(dir: &Path) -> Result<()> {
     use crate::win_acl::{current_user_sid, untrusted_access, ANCESTOR_RIGHTS, DIR_RIGHTS};
 
     let shown = crate::display::escape_path(dir);
     let user = current_user_sid()?;
+    // Windows resolves `..` by the name, so the absolute path is the one used
     let written = std::path::absolute(dir).with_context(|| format!("Failed to resolve {shown}"))?;
-    let real = dir
-        .canonicalize()
-        .with_context(|| format!("Failed to resolve {shown}"))?;
-    if let Some(why) = untrusted_access(&real, &user, DIR_RIGHTS)? {
-        anyhow::bail!("Refusing to use {shown}: {why}");
-    }
-    for ancestor in real.ancestors().skip(1).chain(written.ancestors().skip(1)) {
-        if let Some(why) = untrusted_access(ancestor, &user, ANCESTOR_RIGHTS)? {
-            anyhow::bail!(
-                "Refusing to use {shown}: another user could replace it through {} ({why})",
-                crate::display::escape_path(ancestor)
-            );
+    let mut ancestors: Vec<&Path> = written.ancestors().collect();
+    ancestors.reverse();
+    let mut holder: Option<&Path> = None;
+    for path in ancestors {
+        if let Some(holder) = holder {
+            if let Some(why) = untrusted_access(holder, &user, ANCESTOR_RIGHTS)? {
+                anyhow::bail!(
+                    "Refusing to use {shown}: another user could replace it through {} ({why})",
+                    crate::display::escape_path(holder)
+                );
+            }
+            let meta = std::fs::symlink_metadata(path)
+                .with_context(|| format!("Failed to check {shown}"))?;
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "Refusing to use {shown}: {} is a link or junction; use the real directory",
+                    crate::display::escape_path(path)
+                );
+            }
         }
+        holder = Some(path);
+    }
+    if let Some(why) = untrusted_access(&written, &user, DIR_RIGHTS)? {
+        anyhow::bail!("Refusing to use {shown}: {why}");
     }
     Ok(())
 }
@@ -202,9 +293,10 @@ mod tests {
 
     #[test]
     fn test_data_file_path() {
-        std::env::set_var("META_DATA_DIR", "/tmp/test-meta");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("META_DATA_DIR", tmp.path());
         let path = data_file("worktree").unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/test-meta/worktree.json"));
+        assert_eq!(path, tmp.path().join("worktree.json"));
         std::env::remove_var("META_DATA_DIR");
     }
 
@@ -294,6 +386,41 @@ mod tests {
         assert!(removed.success());
         let err = check_private_dir(&inner).unwrap_err().to_string();
         assert!(err.contains("another user could replace it"), "{err}");
+
+        // A junction to a private directory is refused: it could be repointed
+        let private = tmp.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        let junction = tmp.path().join("junction");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&private)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        check_private_dir(&private).unwrap();
+        let err = check_private_dir(&junction).unwrap_err().to_string();
+        assert!(err.contains("is a link or junction"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_group_write_is_fine_only_for_your_private_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A 0775 directory gets your primary group; whether that group is
+        // private to you depends on the machine, and decides the outcome
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ws");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        // SAFETY: no preconditions
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let gid_of_dir = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&dir).unwrap());
+        let private = gid_of_dir == gid && is_private_group(gid, uid);
+        assert_eq!(check_private_dir(&dir).is_ok(), private);
+        // A group that is not yours never counts
+        assert!(!is_private_group(gid.wrapping_add(1), uid));
     }
 
     #[cfg(unix)]

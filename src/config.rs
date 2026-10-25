@@ -400,10 +400,18 @@ fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
             Err(_) => exists = false,
             Ok(meta) if meta.file_type().is_symlink() => match current.canonicalize() {
                 Ok(target) if target.starts_with(&base) => current = target,
-                _ => {
+                Ok(_) => {
                     return Err(format!(
                         "path '{rel}' leads outside {} through the symlink '{}'",
                         escape_path(&base),
+                        escape_path(&current)
+                    ))
+                }
+                // Its target may not exist yet, but where it would lead
+                // cannot be checked, so it is refused
+                Err(e) => {
+                    return Err(format!(
+                        "path '{rel}' goes through the symlink '{}', which cannot be resolved: {e}",
                         escape_path(&current)
                     ))
                 }
