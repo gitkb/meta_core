@@ -254,12 +254,14 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 /// join `path` onto the directory of the `.meta` file without checking again:
 /// - No value (name, path, repo, tags, provides, depends_on) is empty or holds
 ///   a control or bidirectional-control character ([`is_unsafe_char`]).
-/// - `name` is one path component: not `.` or `..`, no `/`, `\` or drive
-///   prefix.
+/// - `name` is one path component: not `.` or `..`, no `/` or `\`.
+/// - Neither the name nor any path component means something else on
+///   Windows ([`windows_ambiguity`]): no drive prefix, `<>:"|?*`, trailing
+///   dot or space, `~` and digit, or device name.
 /// - `path` (the name when omitted) is relative and stays inside the config's
 ///   directory: `\` reads as `/`, empty and `.` components are dropped, `..`
-///   and drive prefixes (`C:`) are rejected, something must remain, and no
-///   symlink along it may lead outside the directory.
+///   is rejected, something must remain, and no symlink along it may lead
+///   outside the directory.
 /// - `repo` does not start with `-`, so git cannot read it as an option.
 /// - Tags hold no whitespace and no `,`, which the `--tag` filter splits on.
 ///
@@ -289,13 +291,11 @@ fn validate_project(base_dir: &Path, info: &mut ProjectInfo) -> Result<PathBuf, 
             ));
         }
     }
-    if matches!(info.name.as_str(), "." | "..")
-        || info.name.contains(['/', '\\'])
-        || starts_with_drive(&info.name)
-    {
-        return Err(
-            "name must be a single path component (no '/', '\\', drive prefix, '.' or '..')".into(),
-        );
+    if matches!(info.name.as_str(), "." | "..") || info.name.contains(['/', '\\']) {
+        return Err("name must be a single path component (no '/', '\\', '.' or '..')".into());
+    }
+    if let Some(why) = windows_ambiguity(&info.name) {
+        return Err(format!("name has {why}"));
     }
     if info.repo.as_deref().is_some_and(|r| r.starts_with('-')) {
         return Err("repo must not start with '-'".into());
@@ -348,11 +348,44 @@ fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
     Ok(())
 }
 
-/// True for a `C:` prefix, which makes a Windows path absolute or
-/// drive-relative wherever it appears.
-fn starts_with_drive(s: &str) -> bool {
-    let mut chars = s.chars();
-    matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
+/// What would make a name or path component mean something else on
+/// Windows, where the same `.meta` may be used: a drive prefix, a character
+/// Windows refuses or treats specially, a trailing dot or space (which
+/// Windows drops, so `a.` is `a`), a `~` and digit as in a short name like
+/// `PROGRA~1` (an alias of another name), or a device name like `NUL`.
+fn windows_ambiguity(part: &str) -> Option<&'static str> {
+    let mut chars = part.chars();
+    if matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic()) {
+        return Some("a drive prefix");
+    }
+    if part.contains(['<', '>', ':', '"', '|', '?', '*']) {
+        return Some("a character Windows does not allow (<>:\"|?*)");
+    }
+    if part.ends_with(['.', ' ']) {
+        return Some("a trailing dot or space, which Windows drops");
+    }
+    let short_name = part.match_indices('~').any(|(i, _)| {
+        part.get(i + 1..)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    });
+    if short_name {
+        return Some("a '~' and digit, as in a Windows short name");
+    }
+    let stem = part
+        .split('.')
+        .next()
+        .unwrap_or(part)
+        .trim_end()
+        .to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        stem.strip_prefix(prefix)
+            .is_some_and(|n| n.len() == 1 && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT")
+    {
+        return Some("a Windows device name");
+    }
+    None
 }
 
 /// Normalize a project path to `a/b` form, rejecting anything that is not a
@@ -367,10 +400,10 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
         match part {
             "" | "." => {}
             ".." => return Err(format!("path '{raw}' must not contain '..'")),
-            part if starts_with_drive(part) => {
-                return Err(format!("path '{raw}' must be relative (no drive prefix)"))
-            }
-            part => parts.push(part),
+            part => match windows_ambiguity(part) {
+                Some(why) => return Err(format!("path '{raw}' has a component with {why}")),
+                None => parts.push(part),
+            },
         }
     }
     if parts.is_empty() {
@@ -385,7 +418,7 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
 /// refuse it if one leads outside `base_dir` or if it ends at `base_dir`.
 /// Returns the project's location: the real path of the part that exists,
 /// followed by the part not created yet.
-fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
+pub fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let base = base_dir
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", escape_path(base_dir)))?;
@@ -1399,6 +1432,56 @@ mod tests {
             let err = parse_err(json);
             assert!(err.contains("drive prefix"), "{json}: {err}");
         }
+    }
+
+    #[test]
+    fn test_parse_rejects_names_and_paths_windows_reads_differently() {
+        for (json, what) in [
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "a./x"}}}"#,
+                "trailing dot",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "a /x"}}}"#,
+                "trailing dot or space",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "PROGRA~1/x"}}}"#,
+                "short name",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "x/nul"}}}"#,
+                "device name",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "con.txt"}}}"#,
+                "device name",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "x/com1"}}}"#,
+                "device name",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "ab:c"}}}"#,
+                "does not allow",
+            ),
+            (r#"{"projects": {"x|y": "u"}}"#, "does not allow"),
+            (
+                r#"{"projects": {"a.": {"repo": "u", "path": "b"}}}"#,
+                "trailing dot",
+            ),
+        ] {
+            let err = parse_err(json);
+            assert!(err.contains(what), "{json}: {err}");
+        }
+        // Ordinary names that only look similar are fine
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"console": "u", "a.b": "u", "com10": "u", "x~y": "u", "lpt": "u"}}"#,
+        )
+        .unwrap();
+        assert!(parse_meta_config(&dir.path().join(".meta")).is_ok());
     }
 
     #[test]

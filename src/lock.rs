@@ -9,7 +9,8 @@
 //!
 //! On Unix the lock's directory must belong to the current user and must not
 //! be writable by group or others; anyone else who could write there could
-//! replace the lock file or the store beside it.
+//! replace the lock file or the store beside it. The lock file itself is
+//! 0600, since anyone who can open it can hold the lock.
 
 use crate::display::escape_path;
 use anyhow::{Context, Result};
@@ -39,13 +40,29 @@ pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
     if let Some(parent) = lock_path.parent() {
         crate::data_dir::create_private_dir(parent)?;
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    // Readable by no one else: anyone who can open the file can hold the
+    // lock and block every store write
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
         .open(lock_path)
         .with_context(|| format!("Failed to open lock file: {}", escape_path(lock_path)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // a lock file left by an older meta may still be 0644
+        let mode = file
+            .metadata()
+            .with_context(|| format!("Failed to stat {}", escape_path(lock_path)))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to restrict {}", escape_path(lock_path)))?;
+        }
+    }
 
     let deadline = Instant::now() + timeout;
     loop {
@@ -113,6 +130,21 @@ mod tests {
             fs::write(&lock_path, content).unwrap();
             acquire(&lock_path, Duration::ZERO).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_lock_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("x.lock");
+        // An older meta's leftover lock file, readable by everyone
+        fs::write(&lock_path, "123\n").unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(acquire(&lock_path, WAIT).unwrap());
+        let mode = fs::metadata(&lock_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
