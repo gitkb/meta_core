@@ -48,7 +48,7 @@ pub fn data_subdir(namespace: &str) -> Result<PathBuf> {
 }
 
 /// Create `dir` (mode 0700 on Unix) if missing, then check it is private.
-fn create_private_dir(dir: &Path) -> Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -91,9 +91,13 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
 
     // Resolve the path one component at a time, checking the directory that
     // holds each entry before following it.
-    let absolute = std::env::current_dir()
-        .context("Failed to read the current directory")?
-        .join(dir);
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("Failed to read the current directory")?
+            .join(dir)
+    };
     let mut pending: Vec<OsString> = Vec::new();
     let push_rev = |pending: &mut Vec<OsString>, path: &Path| {
         for c in path.components().rev() {
@@ -115,7 +119,8 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
         let sticky = holder.mode() & 0o1000 != 0;
         if (holder.uid() != uid && holder.uid() != 0) || (holder.mode() & 0o022 != 0 && !sticky) {
             anyhow::bail!(
-                "Refusing to use {shown}: another user could replace it through {}",
+                "Refusing to use {shown}: another user could replace it through {} \
+                 (it must belong to you or root and not be writable by others)",
                 crate::display::escape_path(&current)
             );
         }
@@ -158,8 +163,35 @@ pub fn check_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuse a directory that another user owns or can write to.
-#[cfg(not(unix))]
+/// Refuse a directory that an account other than you, SYSTEM,
+/// Administrators or TrustedInstaller owns or may change, or that sits in a
+/// directory where such an account could rename or replace it.
+#[cfg(windows)]
+pub fn check_private_dir(dir: &Path) -> Result<()> {
+    use crate::win_acl::{current_user_sid, untrusted_access, ANCESTOR_RIGHTS, DIR_RIGHTS};
+
+    let shown = crate::display::escape_path(dir);
+    let user = current_user_sid()?;
+    let written = std::path::absolute(dir).with_context(|| format!("Failed to resolve {shown}"))?;
+    let real = dir
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve {shown}"))?;
+    if let Some(why) = untrusted_access(&real, &user, DIR_RIGHTS)? {
+        anyhow::bail!("Refusing to use {shown}: {why}");
+    }
+    for ancestor in real.ancestors().skip(1).chain(written.ancestors().skip(1)) {
+        if let Some(why) = untrusted_access(ancestor, &user, ANCESTOR_RIGHTS)? {
+            anyhow::bail!(
+                "Refusing to use {shown}: another user could replace it through {} ({why})",
+                crate::display::escape_path(ancestor)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// No ownership model to check on other platforms.
+#[cfg(not(any(unix, windows)))]
 pub fn check_private_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
@@ -226,6 +258,42 @@ mod tests {
         // A sticky parent, like /tmp, keeps others from renaming it
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
         check_private_dir(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_refuses_dir_others_can_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shared");
+        std::fs::create_dir(&dir).unwrap();
+        check_private_dir(&dir).unwrap();
+
+        // Let Everyone modify it
+        let granted = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)M"])
+            .status()
+            .unwrap();
+        assert!(granted.success());
+        let err = check_private_dir(&dir).unwrap_err().to_string();
+        assert!(err.contains("S-1-1-0 may change it"), "{err}");
+
+        // A private directory inside it can be replaced through it
+        let inner = dir.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        let removed = std::process::Command::new("icacls")
+            .arg(&inner)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+            ])
+            .status()
+            .unwrap();
+        assert!(removed.success());
+        let err = check_private_dir(&inner).unwrap_err().to_string();
+        assert!(err.contains("another user could replace it"), "{err}");
     }
 
     #[cfg(unix)]

@@ -37,8 +37,7 @@ pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         if !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory: {}", escape_path(parent)))?;
+            crate::data_dir::create_private_dir(parent)?;
         }
     }
 

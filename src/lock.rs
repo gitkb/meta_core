@@ -13,7 +13,7 @@
 
 use crate::display::escape_path;
 use anyhow::{Context, Result};
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,9 +37,7 @@ impl LockGuard {
 /// Waits up to `timeout` while another process holds the lock, then fails.
 pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
     if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create lock directory: {}", escape_path(parent)))?;
-        crate::data_dir::check_private_dir(parent)?;
+        crate::data_dir::create_private_dir(parent)?;
     }
     let file = OpenOptions::new()
         .read(true)
@@ -76,6 +74,7 @@ pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<LockGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     const WAIT: Duration = Duration::from_millis(200);
 
