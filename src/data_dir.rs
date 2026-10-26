@@ -48,7 +48,7 @@ pub fn data_subdir(namespace: &str) -> Result<PathBuf> {
 }
 
 /// Create `dir` (mode 0700 on Unix) if missing, then check it is private.
-pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
+pub fn create_private_dir(dir: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

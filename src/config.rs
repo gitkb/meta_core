@@ -848,7 +848,13 @@ fn walk_inner(
         let project_dir = base_dir.join(&project.path);
 
         // Check if this project has its own .meta file directly in its directory
-        let nested_config = find_meta_config_in(&project_dir)?;
+        // Past the depth limit it is never read, so a config that can't be
+        // examined only stops a walk that would recurse into it
+        let nested_config = if current_depth < max_depth {
+            find_meta_config_in(&project_dir)?
+        } else {
+            find_meta_config_in(&project_dir).ok().flatten()
+        };
         let has_meta = nested_config.is_some();
 
         // Recurse into children if within depth limit and this is a meta repo.
