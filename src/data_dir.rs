@@ -4,7 +4,7 @@
 //! within the meta data directory. Any crate/plugin can use this module to
 //! store data at `~/.meta/<namespace>.json` or `~/.meta/<namespace>/`.
 //!
-//! The directory holds per-user state (stores, locks, plugins), so meta creates
+//! The directory holds per-user state (stores, plugins), so meta creates
 //! it, and its subdirectories, private to the user (0700 on Unix).
 //!
 //! Use `meta_core::meta_dir()` to get the directory path directly.

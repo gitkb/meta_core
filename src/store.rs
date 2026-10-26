@@ -1,8 +1,7 @@
-//! Atomic JSON store read/write with lock-protected updates.
+//! Atomic JSON store read/write.
 //!
-//! Provides generic utilities for reading, writing, and updating JSON files
-//! with atomic write semantics (write to a temporary file, then rename) and optional
-//! lock protection for concurrent access.
+//! Provides generic utilities for reading and writing JSON files with
+//! atomic write semantics (write to a temporary file, then rename).
 
 use crate::display::escape_path;
 use anyhow::{Context, Result};
@@ -90,29 +89,6 @@ fn follow_links(path: &Path) -> Result<std::path::PathBuf> {
     anyhow::bail!("Too many levels of symbolic links: {}", escape_path(&path))
 }
 
-/// Read-modify-write with lock protection.
-///
-/// 1. Acquires the lock at `lock_path`
-/// 2. Reads the current data from `data_path` (or `T::default()` if missing)
-/// 3. Applies the mutation function `f`
-/// 4. Writes the modified data atomically
-/// 5. Releases the lock (via RAII guard drop)
-///
-/// This is the primary API for concurrent store access.
-pub fn update<T, F>(data_path: &Path, lock_path: &Path, f: F) -> Result<()>
-where
-    T: DeserializeOwned + Default + Serialize,
-    F: FnOnce(&mut T),
-{
-    let _guard = crate::lock::acquire(lock_path, std::time::Duration::from_secs(5))?;
-
-    let mut data: T = read(data_path)?;
-    f(&mut data);
-    write_atomic(data_path, &data)?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,33 +134,6 @@ mod tests {
         let store = TestStore::default();
         write_atomic(&path, &store).unwrap();
         assert!(path.exists());
-    }
-
-    #[test]
-    fn test_update_with_lock() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_path = tmp.path().join("store.json");
-        let lock_path = tmp.path().join("store.lock");
-
-        // First update — creates the file
-        update::<TestStore, _>(&data_path, &lock_path, |store| {
-            store.items.insert("first".to_string(), "1".to_string());
-        })
-        .unwrap();
-
-        // Second update — modifies existing
-        update::<TestStore, _>(&data_path, &lock_path, |store| {
-            store.items.insert("second".to_string(), "2".to_string());
-        })
-        .unwrap();
-
-        // Verify both entries exist
-        let store: TestStore = read(&data_path).unwrap();
-        assert_eq!(store.items.get("first").unwrap(), "1");
-        assert_eq!(store.items.get("second").unwrap(), "2");
-
-        // Lock should be released
-        assert!(crate::lock::acquire(&lock_path, std::time::Duration::from_millis(500)).is_ok());
     }
 
     #[cfg(unix)]
