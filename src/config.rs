@@ -192,9 +192,35 @@ pub fn find_meta_config(
     Ok(None)
 }
 
-/// Nearest directory holding a config file, used for project-local plugins.
+/// The root of the workspace `meta_dir` belongs to: `meta_dir`, or the
+/// nearest meta directory above it whose project tree lists it, and so on
+/// upward. A meta directory its parent doesn't list (or whose parent's tree
+/// can't be read) is a workspace of its own.
+pub fn workspace_root(meta_dir: &Path) -> PathBuf {
+    let mut root = meta_dir.to_path_buf();
+    for parent in meta_dir.ancestors().skip(1) {
+        match find_meta_config_in(parent) {
+            Ok(None) => continue,
+            Ok(Some(_)) if lists(parent, &root) => root = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    root
+}
+
+/// Whether the project tree of the meta directory `parent` lists `dir`.
+fn lists(parent: &Path, dir: &Path) -> bool {
+    let (Ok(tree), Ok(dir)) = (walk_meta_tree(parent, None), dir.canonicalize()) else {
+        return false;
+    };
+    build_project_map(&tree, parent, "")
+        .into_values()
+        .any(|(path, _)| path.canonicalize().is_ok_and(|path| path == dir))
+}
+
+/// Nearest directory holding a config file: where `--local` plugins go.
 /// Plugin scope follows cwd, independently of a command's explicit `--config`.
-pub fn find_workspace_root(start_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+pub fn nearest_meta_dir(start_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     Ok(find_meta_config(start_dir, None)?
         .and_then(|(path, _)| path.parent().map(Path::to_path_buf)))
 }
@@ -2164,19 +2190,48 @@ mod tests {
         }
     }
 
+    fn meta_json(dir: &Path, projects: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(".meta.json"),
+            format!(r#"{{"projects": {{{projects}}}}}"#),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn workspace_root_uses_nearest_config_not_bare_meta_directory() {
+    fn the_root_climbs_only_through_parents_that_list_the_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        meta_json(&top, r#""inner": {"repo": "x", "meta": true}"#);
+        meta_json(&top.join("inner"), r#""deep": {"repo": "x", "meta": true}"#);
+        meta_json(&top.join("inner/deep"), "");
+        assert_eq!(workspace_root(&top.join("inner/deep")), top);
+        assert_eq!(workspace_root(&top.join("inner")), top);
+
+        // A workspace inside another that doesn't list it is its own
+        let unlisted = top.join("inner/elsewhere");
+        meta_json(&unlisted, "");
+        assert_eq!(workspace_root(&unlisted), unlisted);
+        // and so is one under a directory without a config
+        let below = top.join("plain/sub");
+        meta_json(&below, "");
+        assert_eq!(workspace_root(&below), below);
+    }
+
+    #[test]
+    fn nearest_meta_dir_uses_nearest_config_not_bare_meta_directory() {
         let dir = tempfile::tempdir().unwrap();
         let inner = dir.path().join("inner");
         let cwd = inner.join("child");
         std::fs::create_dir_all(cwd.join(".meta/plugins")).unwrap();
         std::fs::write(dir.path().join(".meta.yaml"), "projects: {}").unwrap();
         assert_eq!(
-            find_workspace_root(&cwd).unwrap(),
+            nearest_meta_dir(&cwd).unwrap(),
             Some(dir.path().to_path_buf())
         );
         std::fs::write(inner.join(".meta.json"), "{}").unwrap();
-        assert_eq!(find_workspace_root(&cwd).unwrap(), Some(inner));
+        assert_eq!(nearest_meta_dir(&cwd).unwrap(), Some(inner));
     }
 
     #[cfg(unix)]
