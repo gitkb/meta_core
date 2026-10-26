@@ -12,23 +12,16 @@ use std::path::Path;
 
 /// Read a JSON file, returning `T::default()` if the file doesn't exist.
 ///
-/// Returns an error if the file exists but can't be parsed, or if another
-/// user could have written it (see [`check_private_file`]).
+/// Returns an error if the file exists but can't be read or parsed: only a
+/// missing file means an empty store, so a failed read never lets an update
+/// replace every entry.
 pub fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
-    // Only a missing file means an empty store: any other failure to look
-    // at it must not let an update replace every entry
-    match std::fs::symlink_metadata(path) {
+    let content = match std::fs::read_to_string(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("Failed to stat store file: {}", escape_path(path)))
+        result => {
+            result.with_context(|| format!("Failed to read store file: {}", escape_path(path)))?
         }
-        Ok(_) => {}
-    }
-    check_private_file(path)?;
-
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read store file: {}", escape_path(path)))?;
+    };
 
     if content.trim().is_empty() {
         return Ok(T::default());
@@ -41,8 +34,10 @@ pub fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 /// Write data to a JSON file atomically.
 ///
 /// Writes to a temporary file beside it, then renames it to the target path.
-/// This ensures readers never see a partially-written file.
+/// This ensures readers never see a partially-written file. A store that is
+/// a symlink is followed: its target is replaced, not the link.
 pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
+    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -74,89 +69,12 @@ pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
         .with_context(|| format!("Failed to write temp file: {}", escape_path(&tmp_path)))?;
     drop(file);
 
-    // What it inherited (an access list on Windows, a macOS ACL) must not
-    // let others change it, or the next read would refuse it
-    if let Err(e) = check_private_file(&tmp_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
     let renamed = std::fs::rename(&tmp_path, path)
         .with_context(|| format!("Failed to rename temp file to: {}", escape_path(path)));
     if renamed.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
     renamed
-}
-
-/// Refuse to read a store file another user could have written: anything but
-/// a regular file (such as a symlink to their file), a file owned by someone
-/// else, or one writable by group or others. The directory alone does not
-/// settle this: a file can be writable even where the directory is not.
-#[cfg(unix)]
-pub fn check_private_file(path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Failed to stat {}", escape_path(path)))?;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::geteuid() };
-    let shown = escape_path(path);
-    if !meta.is_file() {
-        anyhow::bail!("Refusing to read {shown}: it is not a regular file (such as a symlink)");
-    }
-    if meta.uid() != uid {
-        anyhow::bail!(
-            "Refusing to read {shown}: it belongs to uid {}, not to you (uid {uid}); \
-             if meta ran as that user (such as with sudo), take it back with: \
-             sudo chown {uid} '{shown}'",
-            meta.uid()
-        );
-    }
-    if meta.mode() & 0o022 != 0 {
-        anyhow::bail!(
-            "Refusing to read {shown}: other users can write to it (fix with: chmod go-w '{shown}')"
-        );
-    }
-    if crate::data_dir::acl_allows_others(path) {
-        anyhow::bail!(
-            "Refusing to read {shown}: its access control list lets others in \
-             (remove with: chmod -N '{shown}')"
-        );
-    }
-    Ok(())
-}
-
-/// On Windows: a regular file that no account but you and the system's own
-/// owns or may change (whether by its own entries or inherited ones).
-#[cfg(windows)]
-pub fn check_private_file(path: &Path) -> Result<()> {
-    use crate::win_acl::{current_user_sid, untrusted_access, DIR_RIGHTS};
-
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Failed to stat {}", escape_path(path)))?;
-    if !meta.is_file() {
-        anyhow::bail!(
-            "Refusing to read {}: it is not a regular file",
-            escape_path(path)
-        );
-    }
-    if let Some(why) = untrusted_access(path, &current_user_sid()?, DIR_RIGHTS, "change")? {
-        anyhow::bail!("Refusing to read {}: {why}", escape_path(path));
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-pub fn check_private_file(path: &Path) -> Result<()> {
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Failed to stat {}", escape_path(path)))?;
-    if !meta.is_file() {
-        anyhow::bail!(
-            "Refusing to read {}: it is not a regular file",
-            escape_path(path)
-        );
-    }
-    Ok(())
 }
 
 /// Read-modify-write with lock protection.
@@ -262,22 +180,30 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("store.json");
+        let path = tmp.path().join("new").join("store.json");
         write_atomic(&path, &TestStore::default()).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
 
-        // A store others could have written is not trusted
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
-        let err = read::<TestStore>(&path).unwrap_err().to_string();
-        assert!(err.contains("Refusing to read"), "{err}");
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_store_is_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        let link = tmp.path().join("store.json");
+        write_atomic(&target, &TestStore::default()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        // Nor is a symlink to someone else's file
-        let other = tmp.path().join("other.json");
-        std::fs::write(&other, "{}").unwrap();
-        std::fs::remove_file(&path).unwrap();
-        std::os::unix::fs::symlink(&other, &path).unwrap();
-        assert!(read::<TestStore>(&path).is_err());
+        let mut store = TestStore::default();
+        store.items.insert("key".to_string(), "value".to_string());
+        write_atomic(&link, &store).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read::<TestStore>(&target).unwrap(), store);
     }
 
     #[test]
