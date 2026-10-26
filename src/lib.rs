@@ -3,15 +3,13 @@
 //! Provides:
 //! - `data_dir` — Locate and create the `~/.meta/` data directory and namespaced files
 //! - `display` — Escaping untrusted text for human-readable output
-//! - `lock` — Exclusive OS file locks that die with their holder
-//! - `store` — Atomic JSON read/write with lock-protected updates
+//! - `store` — Atomic JSON read/write
 
 use std::path::PathBuf;
 
 pub mod config;
 pub mod data_dir;
 pub mod display;
-pub mod lock;
 pub mod store;
 
 /// Default meta data directory name.
