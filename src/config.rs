@@ -568,7 +568,15 @@ pub fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
             continue;
         }
         match current.symlink_metadata() {
-            Err(_) => exists = false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => exists = false,
+            // What can't be examined (no permission, say) may hold a
+            // symlink out, so it is refused rather than taken as missing
+            Err(e) => {
+                return Err(format!(
+                    "path '{rel}' cannot be checked at '{}': {e}",
+                    escape_path(&current)
+                ))
+            }
             Ok(meta) if meta.file_type().is_symlink() => match current.canonicalize() {
                 Ok(target) if target.starts_with(&base) => current = target,
                 Ok(_) => {

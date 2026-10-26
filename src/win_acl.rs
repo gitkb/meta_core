@@ -153,11 +153,13 @@ pub fn untrusted_access(dir: &Path, user: &str, rights: u32, verb: &str) -> Resu
                     }
                     _ => continue,
                 }
-                let allowed = &*ace.cast::<ACCESS_ALLOWED_ACE>();
-                if allowed.Mask & rights == 0 {
+                // The SID runs past the struct, so its pointer comes from the
+                // raw entry pointer, not from a reference to the struct
+                let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+                if (*allowed).Mask & rights == 0 {
                     continue;
                 }
-                let sid = sid_string(std::ptr::addr_of!(allowed.SidStart).cast_mut().cast())?;
+                let sid = sid_string(std::ptr::addr_of_mut!((*allowed).SidStart).cast())?;
                 if !trusted(&sid) {
                     return Ok(Some(format!("{sid} may {verb} it")));
                 }

@@ -14,19 +14,29 @@ use std::fmt::Write;
 /// controls and DEL; the Unicode bidirectional controls, which reorder how a
 /// line is displayed (U+061C, U+200E-F, U+202A-E, U+2066-9); the line and
 /// paragraph separators (U+2028-9), which many renderers treat as line
-/// breaks; and invisible format characters that hide text from a reader
-/// (soft hyphen, zero-width characters, word joiners, BOM, tag characters).
+/// breaks; and invisible characters that hide text from a reader or make one
+/// value look like another (soft hyphen, combining grapheme joiner, Hangul
+/// fillers, Mongolian vowel separator, zero-width characters, word joiners
+/// and deprecated format controls, BOM, interlinear
+/// annotation controls, tag characters).
 pub fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
             '\u{AD}'
+                | '\u{034F}'
                 | '\u{061C}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{180E}'
                 | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2069}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{3164}'
                 | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF9}'..='\u{FFFB}'
                 | '\u{E0000}'..='\u{E007F}'
+
         )
 }
 
@@ -89,6 +99,16 @@ mod tests {
             escape("zw\u{200b}j\u{2060}t\u{e0041}"),
             "zw\\u{200b}j\\u{2060}t\\u{e0041}"
         );
+    }
+
+    #[test]
+    fn invisible_fillers_are_made_visible() {
+        assert_eq!(
+            escape("a\u{34f}b\u{3164}c\u{180e}d\u{206a}e\u{fff9}f"),
+            "a\\u{34f}b\\u{3164}c\\u{180e}d\\u{206a}e\\u{fff9}f"
+        );
+        // Emoji keep their variation selector
+        assert!(matches!(escape("ok \u{2714}\u{fe0f}"), Cow::Borrowed(_)));
     }
 
     #[test]
