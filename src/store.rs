@@ -37,7 +37,7 @@ pub fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 /// This ensures readers never see a partially-written file. A store that is
 /// a symlink is followed: its target is replaced (or created), not the link.
 pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
-    let path = &follow_links(path);
+    let path = &follow_links(path)?;
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -78,16 +78,16 @@ pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
 }
 
 /// Where `path` leads through its symlinks, even to a target that does not
-/// exist yet. Stops after 40 links; opening the result then reports the loop.
-fn follow_links(path: &Path) -> std::path::PathBuf {
+/// exist yet. More than 40 links (a loop) is an error, as opening it would be.
+fn follow_links(path: &Path) -> Result<std::path::PathBuf> {
     let mut path = path.to_path_buf();
-    for _ in 0..40 {
+    for _ in 0..=40 {
         match std::fs::read_link(&path) {
             Ok(target) => path = path.parent().unwrap_or(Path::new("")).join(target),
-            Err(_) => break,
+            Err(_) => return Ok(path),
         }
     }
-    path
+    anyhow::bail!("Too many levels of symbolic links: {}", escape_path(&path))
 }
 
 /// Read-modify-write with lock protection.
@@ -230,6 +230,12 @@ mod tests {
             read::<TestStore>(&tmp.path().join("new.json")).unwrap(),
             store
         );
+
+        // A link loop fails and is left as it is
+        let looped = tmp.path().join("loop.json");
+        std::os::unix::fs::symlink("loop.json", &looped).unwrap();
+        assert!(write_atomic(&looped, &store).is_err());
+        assert_eq!(std::fs::read_link(&looped).unwrap(), Path::new("loop.json"));
     }
 
     #[test]
