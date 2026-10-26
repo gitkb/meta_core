@@ -104,86 +104,99 @@ pub enum ConfigFormat {
     Yaml,
 }
 
-/// The config file directly in directory `dir` (`.meta`, `.meta.json`,
-/// `.meta.yaml`, `.meta.yml`, in that order). Only a missing directory or
-/// file means there is none: one
-/// that cannot be examined (no permission, a link whose target is out of
-/// reach) is an error, since skipping it would silently drop its repos.
-/// A `.meta` directory (the plugins folder) is not a config.
+/// Supported config filenames. Exactly one may be a file in a directory.
+pub const META_CONFIG_NAMES: [&str; 4] = [".meta", ".meta.json", ".meta.yaml", ".meta.yml"];
+
+fn config_format(path: &Path) -> ConfigFormat {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("yaml" | "yml") => ConfigFormat::Yaml,
+        _ => ConfigFormat::Json,
+    }
+}
+
+fn config_file_exists(path: &Path) -> anyhow::Result<bool> {
+    let unreadable = |e| anyhow::anyhow!("Cannot read {}: {e}", escape_path(path));
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(unreadable(e)),
+        Ok(_) => {}
+    }
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file())
+        .map_err(unreadable)
+}
+
+/// Find the config directly in `dir`, using [`META_CONFIG_NAMES`].
+/// Multiple config files or a candidate that cannot be examined are errors.
+/// A `.meta` directory (for plugins and skills) is never a config.
 pub fn find_meta_config_in(dir: &Path) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
-    let unreadable =
-        |path: &Path, e: std::io::Error| anyhow::anyhow!("Cannot read {}: {e}", escape_path(path));
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => return Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(unreadable(dir, e)),
+        Err(e) => return Err(e).with_context(|| format!("Cannot read {}", escape_path(dir))),
     }
-    for (name, format) in &[
-        (".meta", ConfigFormat::Json),
-        (".meta.json", ConfigFormat::Json),
-        (".meta.yaml", ConfigFormat::Yaml),
-        (".meta.yml", ConfigFormat::Yaml),
-    ] {
+    let mut found = Vec::new();
+    for name in META_CONFIG_NAMES {
         let candidate = dir.join(name);
-        match std::fs::symlink_metadata(&candidate) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(unreadable(&candidate, e)),
-            Ok(_) => {}
+        if config_file_exists(&candidate)? {
+            found.push(candidate);
         }
-        match std::fs::metadata(&candidate) {
-            Ok(meta) if meta.is_file() => return Ok(Some((candidate, format.clone()))),
-            Ok(_) => continue,
-            Err(e) => return Err(unreadable(&candidate, e)),
+    }
+    if found.len() > 1 {
+        anyhow::bail!(
+            "Multiple meta config files in {}: {}. Keep exactly one config file.",
+            escape_path(dir),
+            found
+                .iter()
+                .map(|p| escape_path(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if let Some(path) = found.pop() {
+        std::fs::File::open(&path)
+            .with_context(|| format!("Cannot read {}", escape_path(&path)))?;
+        let format = config_format(&path);
+        Ok(Some((path, format)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Find the nearest config, walking from `start_dir` to the filesystem root.
+/// Uses [`META_CONFIG_NAMES`], refusing ambiguous or unreadable configs.
+/// An explicit `config_name` selects only that filename instead.
+pub fn find_meta_config(
+    start_dir: &Path,
+    config_name: Option<&PathBuf>,
+) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+    for dir in start_dir.ancestors() {
+        let found = if let Some(name) = config_name {
+            let path = dir.join(name);
+            if config_file_exists(&path)? {
+                std::fs::File::open(&path)
+                    .with_context(|| format!("Cannot read {}", escape_path(&path)))?;
+                let format = config_format(&path);
+                Some((path, format))
+            } else {
+                None
+            }
+        } else {
+            find_meta_config_in(dir)?
+        };
+        if found.is_some() {
+            return Ok(found);
         }
     }
     Ok(None)
 }
 
-/// Find the meta config file, checking for .meta, .meta.yaml, and .meta.yml
-///
-/// Walks up from `start_dir` to the filesystem root, looking for config files.
-/// If `config_name` is provided, only looks for that specific filename.
-pub fn find_meta_config(
-    start_dir: &Path,
-    config_name: Option<&PathBuf>,
-) -> Option<(PathBuf, ConfigFormat)> {
-    let candidates: Vec<(String, ConfigFormat)> = if let Some(name) = config_name {
-        // User specified a config file name
-        let name_str = name.to_string_lossy().to_string();
-        if name_str.ends_with(".yaml") || name_str.ends_with(".yml") {
-            vec![(name_str, ConfigFormat::Yaml)]
-        } else {
-            vec![(name_str, ConfigFormat::Json)]
-        }
-    } else {
-        // Default: check all supported names
-        vec![
-            (".meta".to_string(), ConfigFormat::Json),
-            (".meta.json".to_string(), ConfigFormat::Json),
-            (".meta.yaml".to_string(), ConfigFormat::Yaml),
-            (".meta.yml".to_string(), ConfigFormat::Yaml),
-        ]
-    };
-
-    let mut current_dir = start_dir.to_path_buf();
-    loop {
-        for (name, format) in &candidates {
-            let candidate = current_dir.join(name);
-            // A candidate that exists but can't be examined is returned, so
-            // reading it fails loudly, rather than skipped for a config
-            // further up (another workspace's)
-            let found = match std::fs::symlink_metadata(&candidate) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Err(_) => true,
-                Ok(_) => !matches!(std::fs::metadata(&candidate), Ok(meta) if !meta.is_file()),
-            };
-            if found {
-                return Some((candidate, format.clone()));
-            }
-        }
-        current_dir = current_dir.parent()?.to_path_buf();
-    }
+/// Nearest directory holding a config file, used for project-local plugins.
+/// Plugin scope follows cwd, independently of a command's explicit `--config`.
+pub fn find_workspace_root(start_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    Ok(find_meta_config(start_dir, None)?
+        .and_then(|(path, _)| path.parent().map(Path::to_path_buf)))
 }
 
 /// Parse a meta config file (JSON or YAML) and return normalized project info and ignore list.
@@ -720,7 +733,7 @@ pub fn walk_meta_tree(
     start_dir: &Path,
     max_depth: Option<usize>,
 ) -> anyhow::Result<Vec<MetaTreeNode>> {
-    let (config_path, _format) = find_meta_config(start_dir, None)
+    let (config_path, _format) = find_meta_config(start_dir, None)?
         .ok_or_else(|| anyhow::anyhow!("No .meta config found in {}", escape_path(start_dir)))?;
 
     let (projects, _ignore) = parse_meta_config(&config_path)?;
@@ -800,6 +813,8 @@ pub struct OrphanWarning {
     pub current: PathBuf,
     /// Path to the parent meta directory
     pub parent: PathBuf,
+    /// Actual parent config path for the inclusion hint.
+    pub parent_config: PathBuf,
     /// Suggested key to add to parent's .meta file
     pub suggested_key: String,
     /// Format of the parent's config file (for showing appropriate syntax)
@@ -810,9 +825,11 @@ pub struct OrphanWarning {
 ///
 /// Starts searching from the parent of `meta_dir` and walks up.
 /// Returns None if this is the root meta repo (no parent .meta found).
-pub fn find_parent_meta_config(meta_dir: &Path) -> Option<(PathBuf, ConfigFormat)> {
-    let parent = meta_dir.parent()?;
-    find_meta_config(parent, None)
+pub fn find_parent_meta_config(meta_dir: &Path) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+    match meta_dir.parent() {
+        Some(parent) => find_meta_config(parent, None),
+        None => Ok(None),
+    }
 }
 
 /// Find the root (topmost) meta directory by walking up through parent .meta configs.
@@ -820,17 +837,22 @@ pub fn find_parent_meta_config(meta_dir: &Path) -> Option<(PathBuf, ConfigFormat
 /// Starting from `meta_dir`, repeatedly calls `find_parent_meta_config` until
 /// no more parents are found. Returns the topmost meta directory in the hierarchy.
 /// If `meta_dir` is already the root, returns it unchanged.
-pub fn find_root_meta_dir(meta_dir: &Path) -> PathBuf {
+pub fn find_root_meta_dir(meta_dir: &Path) -> anyhow::Result<PathBuf> {
     let mut current = meta_dir.to_path_buf();
     loop {
-        match find_parent_meta_config(&current) {
+        match find_parent_meta_config(&current)? {
             Some((parent_config_path, _format)) => {
                 current = parent_config_path
                     .parent()
-                    .expect("config file path should always have a parent directory")
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Config path has no parent: {}",
+                            escape_path(&parent_config_path)
+                        )
+                    })?
                     .to_path_buf();
             }
-            None => break current,
+            None => break Ok(current),
         }
     }
 }
@@ -841,7 +863,7 @@ pub fn find_root_meta_dir(meta_dir: &Path) -> PathBuf {
 /// this directory in its project list (directly or transitively).
 /// Returns `None` if tracked or if there's no parent meta.
 pub fn check_orphan_status(meta_dir: &Path) -> Option<OrphanWarning> {
-    let (parent_config, parent_format) = find_parent_meta_config(meta_dir)?;
+    let (parent_config, parent_format) = find_parent_meta_config(meta_dir).ok()??;
     let parent_meta_dir = parent_config.parent()?;
 
     // Walk the parent's project tree to see what's tracked
@@ -871,6 +893,7 @@ pub fn check_orphan_status(meta_dir: &Path) -> Option<OrphanWarning> {
         Some(OrphanWarning {
             current: meta_dir.to_path_buf(),
             parent: parent_meta_dir.to_path_buf(),
+            parent_config: parent_config.clone(),
             suggested_key,
             parent_format,
         })
@@ -1337,7 +1360,7 @@ mod tests {
         std::fs::write(dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
 
         // No parent above this directory
-        let result = find_parent_meta_config(dir.path());
+        let result = find_parent_meta_config(dir.path()).unwrap();
         assert!(result.is_none());
     }
 
@@ -1352,7 +1375,7 @@ mod tests {
         // Nested .meta
         std::fs::write(nested.join(".meta"), r#"{"projects": {}}"#).unwrap();
 
-        let result = find_parent_meta_config(&nested);
+        let result = find_parent_meta_config(&nested).unwrap();
         assert!(result.is_some());
         let (path, _) = result.unwrap();
         assert_eq!(path, dir.path().join(".meta"));
@@ -2055,7 +2078,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
 
-        let root = find_root_meta_dir(dir.path());
+        let root = find_root_meta_dir(dir.path()).unwrap();
         assert_eq!(root, dir.path());
     }
 
@@ -2073,7 +2096,7 @@ mod tests {
         .unwrap();
         std::fs::write(child.join(".meta"), r#"{"projects": {}}"#).unwrap();
 
-        let root = find_root_meta_dir(&child);
+        let root = find_root_meta_dir(&child).unwrap();
         assert_eq!(root, dir.path());
     }
 
@@ -2097,13 +2120,79 @@ mod tests {
         .unwrap();
         std::fs::write(grandchild.join(".meta"), r#"{"projects": {}}"#).unwrap();
 
-        let root = find_root_meta_dir(&grandchild);
+        let root = find_root_meta_dir(&grandchild).unwrap();
         assert_eq!(root, dir.path());
     }
 
     // ============================================================================
     // A `.meta/` directory (meta's local folder) is never config
     // ============================================================================
+
+    #[test]
+    fn config_discovery_rejects_all_ambiguous_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        for first in META_CONFIG_NAMES {
+            for second in META_CONFIG_NAMES {
+                if first >= second {
+                    continue;
+                }
+                let a = dir.path().join(first);
+                let b = dir.path().join(second);
+                std::fs::write(&a, "{}").unwrap();
+                std::fs::write(&b, "{}").unwrap();
+                for err in [
+                    find_meta_config_in(dir.path()).unwrap_err(),
+                    find_meta_config(&child, None).unwrap_err(),
+                ] {
+                    let message = err.to_string();
+                    assert!(message.contains("Multiple meta config files"));
+                    assert!(message.contains(&escape_path(&a)), "{message}");
+                    assert!(message.contains(&escape_path(&b)), "{message}");
+                }
+                std::fs::remove_file(a).unwrap();
+                std::fs::remove_file(b).unwrap();
+            }
+        }
+        for name in META_CONFIG_NAMES {
+            std::fs::write(dir.path().join(name), "{}").unwrap();
+        }
+        let message = find_meta_config_in(dir.path()).unwrap_err().to_string();
+        for name in META_CONFIG_NAMES {
+            assert!(message.contains(&escape_path(&dir.path().join(name))));
+        }
+    }
+
+    #[test]
+    fn workspace_root_uses_nearest_config_not_bare_meta_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner");
+        let cwd = inner.join("child");
+        std::fs::create_dir_all(cwd.join(".meta/plugins")).unwrap();
+        std::fs::write(dir.path().join(".meta.yaml"), "projects: {}").unwrap();
+        assert_eq!(
+            find_workspace_root(&cwd).unwrap(),
+            Some(dir.path().to_path_buf())
+        );
+        std::fs::write(inner.join(".meta.json"), "{}").unwrap();
+        assert_eq!(find_workspace_root(&cwd).unwrap(), Some(inner));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_config_is_an_error_in_both_discovery_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".meta.yaml");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_err() {
+            assert!(find_meta_config_in(dir.path()).is_err());
+            assert!(find_meta_config(dir.path(), None).is_err());
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     #[test]
     fn test_meta_directory_is_not_config() {
@@ -2117,7 +2206,10 @@ mod tests {
             find_meta_config_in(dir.path()).unwrap().unwrap().0,
             expected
         );
-        assert_eq!(find_meta_config(dir.path(), None).unwrap().0, expected);
+        assert_eq!(
+            find_meta_config(dir.path(), None).unwrap().unwrap().0,
+            expected
+        );
     }
 
     #[test]
@@ -2128,7 +2220,7 @@ mod tests {
         // Legacy `.meta` config file in the parent
         std::fs::write(dir.path().join(".meta"), r#"{"projects": {"child": "x"}}"#).unwrap();
 
-        let (path, _) = find_meta_config(&child, None).unwrap();
+        let (path, _) = find_meta_config(&child, None).unwrap().unwrap();
         assert_eq!(path, dir.path().join(".meta"));
 
         let tree = walk_meta_tree(dir.path(), None).unwrap();
