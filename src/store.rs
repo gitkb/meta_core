@@ -35,9 +35,9 @@ pub fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 ///
 /// Writes to a temporary file beside it, then renames it to the target path.
 /// This ensures readers never see a partially-written file. A store that is
-/// a symlink is followed: its target is replaced, not the link.
+/// a symlink is followed: its target is replaced (or created), not the link.
 pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
-    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = &follow_links(path);
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -75,6 +75,19 @@ pub fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
         let _ = std::fs::remove_file(&tmp_path);
     }
     renamed
+}
+
+/// Where `path` leads through its symlinks, even to a target that does not
+/// exist yet. Stops after 40 links; opening the result then reports the loop.
+fn follow_links(path: &Path) -> std::path::PathBuf {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::read_link(&path) {
+            Ok(target) => path = path.parent().unwrap_or(Path::new("")).join(target),
+            Err(_) => break,
+        }
+    }
+    path
 }
 
 /// Read-modify-write with lock protection.
@@ -204,6 +217,19 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(read::<TestStore>(&target).unwrap(), store);
+
+        // A link to a store not written yet creates it, as `echo > link` would
+        let dangling = tmp.path().join("dangling.json");
+        std::os::unix::fs::symlink("new.json", &dangling).unwrap();
+        write_atomic(&dangling, &store).unwrap();
+        assert!(std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            read::<TestStore>(&tmp.path().join("new.json")).unwrap(),
+            store
+        );
     }
 
     #[test]
