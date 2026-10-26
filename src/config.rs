@@ -104,31 +104,13 @@ pub enum ConfigFormat {
     Yaml,
 }
 
-/// Check if a directory has a meta config file (.meta, .meta.yaml, or .meta.yml).
-///
-/// Unlike `find_meta_config`, this does NOT walk up the directory tree.
-/// Returns the path and format if found.
-pub fn find_meta_config_in(dir: &Path) -> Option<(PathBuf, ConfigFormat)> {
-    for (name, format) in &[
-        (".meta", ConfigFormat::Json),
-        (".meta.json", ConfigFormat::Json),
-        (".meta.yaml", ConfigFormat::Yaml),
-        (".meta.yml", ConfigFormat::Yaml),
-    ] {
-        let candidate = dir.join(name);
-        if candidate.exists() && candidate.is_file() {
-            return Some((candidate, format.clone()));
-        }
-    }
-    None
-}
-
-/// The config file directly in project directory `dir`, for walking the
-/// meta tree. Only a missing directory or file means there is none: one
+/// The config file directly in directory `dir` (`.meta`, `.meta.json`,
+/// `.meta.yaml`, `.meta.yml`, in that order). Only a missing directory or
+/// file means there is none: one
 /// that cannot be examined (no permission, a link whose target is out of
 /// reach) is an error, since skipping it would silently drop its repos.
 /// A `.meta` directory (the plugins folder) is not a config.
-fn nested_config_in(dir: &Path) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+pub fn find_meta_config_in(dir: &Path) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
     let unreadable =
         |path: &Path, e: std::io::Error| anyhow::anyhow!("Cannot read {}: {e}", escape_path(path));
     match std::fs::metadata(dir) {
@@ -188,7 +170,15 @@ pub fn find_meta_config(
     loop {
         for (name, format) in &candidates {
             let candidate = current_dir.join(name);
-            if candidate.exists() && candidate.is_file() {
+            // A candidate that exists but can't be examined is returned, so
+            // reading it fails loudly, rather than skipped for a config
+            // further up (another workspace's)
+            let found = match std::fs::symlink_metadata(&candidate) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+                Ok(_) => !matches!(std::fs::metadata(&candidate), Ok(meta) if !meta.is_file()),
+            };
+            if found {
                 return Some((candidate, format.clone()));
             }
         }
@@ -644,7 +634,7 @@ pub fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
 /// Load defaults from a meta config file.
 /// Returns MetaDefaults::default() if no config found or on parse error.
 pub fn load_meta_defaults(start_dir: &Path) -> MetaDefaults {
-    let Some((config_path, _format)) = find_meta_config_in(start_dir) else {
+    let Ok(Some((config_path, _format))) = find_meta_config_in(start_dir) else {
         return MetaDefaults::default();
     };
 
@@ -858,7 +848,7 @@ fn walk_inner(
         let project_dir = base_dir.join(&project.path);
 
         // Check if this project has its own .meta file directly in its directory
-        let nested_config = nested_config_in(&project_dir)?;
+        let nested_config = find_meta_config_in(&project_dir)?;
         let has_meta = nested_config.is_some();
 
         // Recurse into children if within depth limit and this is a meta repo.
@@ -2071,11 +2061,14 @@ mod tests {
     fn test_meta_directory_is_not_config() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".meta/skills")).unwrap();
-        assert!(find_meta_config_in(dir.path()).is_none());
+        assert!(find_meta_config_in(dir.path()).unwrap().is_none());
 
         std::fs::write(dir.path().join(".meta.yaml"), "projects: {}\n").unwrap();
         let expected = dir.path().join(".meta.yaml");
-        assert_eq!(find_meta_config_in(dir.path()).unwrap().0, expected);
+        assert_eq!(
+            find_meta_config_in(dir.path()).unwrap().unwrap().0,
+            expected
+        );
         assert_eq!(find_meta_config(dir.path(), None).unwrap().0, expected);
     }
 
