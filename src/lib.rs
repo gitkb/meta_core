@@ -13,8 +13,6 @@ pub mod data_dir;
 pub mod display;
 pub mod lock;
 pub mod store;
-#[cfg(windows)]
-mod win_acl;
 
 /// Default meta data directory name.
 const META_DIR_NAME: &str = ".meta";
