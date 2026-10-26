@@ -3,6 +3,7 @@
 //! This module provides the core types and functions for finding and parsing
 //! .meta configuration files (JSON and YAML formats).
 
+use crate::display::{escape, escape_path, is_unsafe_char};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -103,11 +104,21 @@ pub enum ConfigFormat {
     Yaml,
 }
 
-/// Check if a directory has a meta config file (.meta, .meta.yaml, or .meta.yml).
-///
-/// Unlike `find_meta_config`, this does NOT walk up the directory tree.
-/// Returns the path and format if found.
-pub fn find_meta_config_in(dir: &Path) -> Option<(PathBuf, ConfigFormat)> {
+/// The config file directly in directory `dir` (`.meta`, `.meta.json`,
+/// `.meta.yaml`, `.meta.yml`, in that order). Only a missing directory or
+/// file means there is none: one
+/// that cannot be examined (no permission, a link whose target is out of
+/// reach) is an error, since skipping it would silently drop its repos.
+/// A `.meta` directory (the plugins folder) is not a config.
+pub fn find_meta_config_in(dir: &Path) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+    let unreadable =
+        |path: &Path, e: std::io::Error| anyhow::anyhow!("Cannot read {}: {e}", escape_path(path));
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(dir, e)),
+    }
     for (name, format) in &[
         (".meta", ConfigFormat::Json),
         (".meta.json", ConfigFormat::Json),
@@ -115,11 +126,18 @@ pub fn find_meta_config_in(dir: &Path) -> Option<(PathBuf, ConfigFormat)> {
         (".meta.yml", ConfigFormat::Yaml),
     ] {
         let candidate = dir.join(name);
-        if candidate.exists() && candidate.is_file() {
-            return Some((candidate, format.clone()));
+        match std::fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(unreadable(&candidate, e)),
+            Ok(_) => {}
+        }
+        match std::fs::metadata(&candidate) {
+            Ok(meta) if meta.is_file() => return Ok(Some((candidate, format.clone()))),
+            Ok(_) => continue,
+            Err(e) => return Err(unreadable(&candidate, e)),
         }
     }
-    None
+    Ok(None)
 }
 
 /// Find the meta config file, checking for .meta, .meta.yaml, and .meta.yml
@@ -152,7 +170,15 @@ pub fn find_meta_config(
     loop {
         for (name, format) in &candidates {
             let candidate = current_dir.join(name);
-            if candidate.exists() && candidate.is_file() {
+            // A candidate that exists but can't be examined is returned, so
+            // reading it fails loudly, rather than skipped for a config
+            // further up (another workspace's)
+            let found = match std::fs::symlink_metadata(&candidate) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+                Ok(_) => !matches!(std::fs::metadata(&candidate), Ok(meta) if !meta.is_file()),
+            };
+            if found {
                 return Some((candidate, format.clone()));
             }
         }
@@ -161,23 +187,56 @@ pub fn find_meta_config(
 }
 
 /// Parse a meta config file (JSON or YAML) and return normalized project info and ignore list.
+///
+/// Every project is checked by [`validate_project`] and no two projects may
+/// share or nest paths ([`check_no_overlap`]); a bad entry fails the parse
+/// with the file and project named.
 pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, Vec<String>)> {
-    let config_str = std::fs::read_to_string(meta_path)
-        .with_context(|| format!("Failed to read meta config file: '{}'", meta_path.display()))?;
+    let config_str = std::fs::read_to_string(meta_path).with_context(|| {
+        format!(
+            "Failed to read meta config file: '{}'",
+            escape_path(meta_path)
+        )
+    })?;
 
     // Determine format from file extension
     let path_str = meta_path.to_string_lossy();
     let config: MetaConfig = if path_str.ends_with(".yaml") || path_str.ends_with(".yml") {
-        serde_yaml_ng::from_str(&config_str)
-            .with_context(|| format!("Failed to parse YAML config file: {}", meta_path.display()))?
+        serde_yaml_ng::from_str(&config_str).with_context(|| {
+            format!(
+                "Failed to parse YAML config file: {}",
+                escape_path(meta_path)
+            )
+        })?
     } else {
-        serde_json::from_str(&config_str)
-            .with_context(|| format!("Failed to parse JSON config file: {}", meta_path.display()))?
+        serde_json::from_str(&config_str).with_context(|| {
+            format!(
+                "Failed to parse JSON config file: {}",
+                escape_path(meta_path)
+            )
+        })?
     };
 
-    // Convert project entries to normalized ProjectInfo
-    let mut projects: Vec<ProjectInfo> = config
-        .projects
+    // Convert project entries to normalized, validated ProjectInfo
+    // in name order, so the first bad entry reported is always the same one
+    let base_dir = meta_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // Where worktrees live (as written, and where that really is); no
+    // project may go there. A bad worktrees_dir is an error like a bad entry.
+    let worktrees = match config.worktrees_dir.as_deref() {
+        Some(dir) => relative_dir(base_dir, dir).map_err(|why| {
+            anyhow::anyhow!("Invalid worktrees_dir in {}: {why}", escape_path(meta_path))
+        })?,
+        None => ".worktrees".to_string(),
+    };
+    let worktrees_at = resolve_inside(base_dir, &worktrees)
+        .ok()
+        .map(|at| PathBuf::from(at.to_string_lossy().to_lowercase()));
+    let mut entries: Vec<_> = config.projects.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let checked: Vec<(ProjectInfo, PathBuf)> = entries
         .into_iter()
         .map(|(name, entry)| {
             let (repo, path, tags, provides, depends_on, meta) = match entry {
@@ -199,8 +258,7 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
                     (repo, resolved_path, tags, provides, depends_on, meta)
                 }
             };
-            let path = path.replace('\\', "/");
-            ProjectInfo {
+            let mut info = ProjectInfo {
                 name,
                 path,
                 repo,
@@ -208,20 +266,375 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
                 provides,
                 depends_on,
                 meta,
-            }
+            };
+            let location =
+                validate_project(base_dir, &worktrees, worktrees_at.as_deref(), &mut info)
+                    .map_err(|reason| {
+                        anyhow::anyhow!(
+                            "Invalid project '{}' in {}: {reason}",
+                            escape(&info.name),
+                            escape_path(meta_path)
+                        )
+                    })?;
+            Ok((info, location))
         })
-        .collect();
-
-    // Sort projects alphabetically by name for deterministic order
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
+        .collect::<anyhow::Result<_>>()?;
+    check_no_overlap(&checked)
+        .map_err(|e| anyhow::anyhow!("Invalid projects in {}: {e}", escape_path(meta_path)))?;
+    // Nor may the worktree directory sit inside a project's checkout
+    if let Some(at) = &worktrees_at {
+        for (info, location) in &checked {
+            if at.starts_with(PathBuf::from(location.to_string_lossy().to_lowercase())) {
+                anyhow::bail!(
+                    "Invalid worktrees_dir in {}: '{}' is inside project '{}'",
+                    escape_path(meta_path),
+                    escape(&worktrees),
+                    escape(&info.name)
+                );
+            }
+        }
+    }
+    let projects = checked.into_iter().map(|(info, _)| info).collect();
 
     Ok((projects, config.ignore))
+}
+
+/// Check one project entry and normalize its path, or say what is wrong.
+///
+/// These rules are checked once, when a config is parsed, so every caller can
+/// join `path` onto the directory of the `.meta` file without checking again:
+/// - No value (name, path, repo, tags, provides, depends_on) is empty or holds
+///   a control or bidirectional-control character ([`is_unsafe_char`]).
+/// - `name` is a relative path in normal form (usually one component; a
+///   nested alias like `vendor/lib` is a worktree destination too), held to
+///   the same rules as `path`.
+/// - The name and every path component pass [`component_problem`]: ASCII
+///   letters, digits, space and `._-+@` only, no trailing dot or space, no
+///   Windows device name, not `.git`. The first component is not `.worktrees`.
+/// - `path` (the name when omitted) is relative and stays inside the config's
+///   directory: `\` reads as `/`, empty and `.` components are dropped, `..`
+///   is rejected, something must remain, and no symlink along it may lead
+///   outside the directory.
+/// - `repo` does not start with `-`, so git cannot read it as an option.
+/// - Tags hold no whitespace and no `,`, which the `--tag` filter splits on.
+///
+/// Returns where the project lives on disk (see [`resolve_inside`]).
+fn validate_project(
+    base_dir: &Path,
+    worktrees: &str,
+    worktrees_at: Option<&Path>,
+    info: &mut ProjectInfo,
+) -> Result<PathBuf, String> {
+    let lists = [
+        ("tag", &info.tags),
+        ("provides entry", &info.provides),
+        ("depends_on entry", &info.depends_on),
+    ];
+    for (what, value) in [("name", &info.name), ("path", &info.path)]
+        .into_iter()
+        .chain(info.repo.iter().map(|r| ("repo", r)))
+        .chain(
+            lists
+                .into_iter()
+                .flat_map(|(what, l)| l.iter().map(move |v| (what, v))),
+        )
+    {
+        if value.is_empty() {
+            return Err(format!("{what} is empty"));
+        }
+        if value.chars().any(is_unsafe_char) {
+            return Err(format!(
+                "{what} '{}' contains control characters",
+                escape(value)
+            ));
+        }
+    }
+    // A name may be a relative path, such as `vendor/lib` for a nested
+    // repo: worktrees put the project at `<worktree>/<name>`. So it follows
+    // the path rules, and must already be in their normal form.
+    let normal = normalize_project_path(&info.name).map_err(|why| format!("name: {why}"))?;
+    if normal != info.name {
+        return Err(format!(
+            "name must be a plain relative path such as 'api' or 'vendor/lib', not '{}'",
+            info.name
+        ));
+    }
+    if info.repo.as_deref().is_some_and(|r| r.starts_with('-')) {
+        return Err("repo must not start with '-'".into());
+    }
+    if let Some(tag) = info
+        .tags
+        .iter()
+        .find(|t| t.contains(|c: char| c.is_whitespace() || c == ','))
+    {
+        return Err(format!("tag '{tag}' contains whitespace or ','"));
+    }
+    info.path = normalize_project_path(&info.path)?;
+    // The configured worktree directory, and the default one always
+    let in_worktrees = |value: &str| {
+        let value = value.to_ascii_lowercase();
+        [worktrees.to_ascii_lowercase(), ".worktrees".to_string()]
+            .iter()
+            .any(|dir| value == *dir || value.starts_with(&format!("{dir}/")))
+    };
+    for value in [&info.name, &info.path] {
+        if in_worktrees(value) {
+            return Err(format!(
+                "'{value}' is inside {worktrees}, where worktrees live"
+            ));
+        }
+    }
+    let location = resolve_inside(base_dir, &info.path)?;
+    // Where it really goes must not be reserved either (`alias -> .git`)
+    let base = base_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", escape_path(base_dir)))?;
+    if let Ok(inside) = location.strip_prefix(&base) {
+        let parts: Vec<String> = inside
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let lowered = PathBuf::from(location.to_string_lossy().to_lowercase());
+        if parts.iter().any(|p| p.eq_ignore_ascii_case(".git"))
+            || in_worktrees(&parts.join("/"))
+            || worktrees_at.is_some_and(|at| lowered.starts_with(at))
+        {
+            return Err(format!(
+                "path '{}' leads into .git or {worktrees} through a symlink",
+                info.path
+            ));
+        }
+    }
+    Ok(location)
+}
+
+/// Check a directory a config names relative to its own directory, such as
+/// `worktrees_dir`, by the rules for project paths, and return its normal
+/// form. (An absolute or outside location is the user's to choose, through
+/// an environment variable such as `META_WORKTREES`, not the config's.)
+pub fn relative_dir(base_dir: &Path, raw: &str) -> Result<String, String> {
+    // An absolute path is fine when it lies inside base_dir
+    let raw_path = Path::new(raw);
+    let relative = if raw_path.is_absolute() {
+        // the real path of the nearest part that exists, then the rest
+        let real = |p: &Path| {
+            let existing = p.ancestors().find(|a| a.exists())?;
+            let rest = p.strip_prefix(existing).ok()?;
+            Some(existing.canonicalize().ok()?.join(rest))
+        };
+        real(base_dir)
+            .zip(real(raw_path))
+            .and_then(|(base, path)| {
+                path.strip_prefix(base)
+                    .ok()
+                    .map(|rest| rest.to_string_lossy().into_owned())
+            })
+            .ok_or_else(|| format!("'{}' is outside {}", escape(raw), escape_path(base_dir)))?
+    } else {
+        raw.to_string()
+    };
+    let normal = normalize_project_path(&relative)?;
+    let location = resolve_inside(base_dir, &normal)?;
+    // Nor may it lead into git's own data
+    let base = base_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", escape_path(base_dir)))?;
+    if location.strip_prefix(&base).is_ok_and(|inside| {
+        inside
+            .components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case(".git"))
+    }) {
+        return Err(format!("'{}' leads into .git", escape(raw)));
+    }
+    Ok(normal)
+}
+
+/// Refuse two projects at one location, or one inside another's directory:
+/// a clone of the outer repo could check out a symlink that the inner path
+/// then follows out of the workspace. Locations are compared as resolved
+/// through existing symlinks, and without case, which some filesystems
+/// ignore. A repo inside another belongs in a nested `.meta` (`meta: true`).
+fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
+    // Paths, by where they resolve; and names, which worktrees use as
+    // destinations (`<worktree>/<name>`)
+    let by_location: Vec<_> = projects
+        .iter()
+        .map(|(info, location)| {
+            (
+                PathBuf::from(location.to_string_lossy().to_lowercase()),
+                info,
+            )
+        })
+        .collect();
+    if let Some((outer, inner)) = nested(&by_location) {
+        return Err(format!(
+            "project '{}' (path '{}') is at or inside project '{}' (path '{}'); \
+             list it in a nested .meta instead",
+            escape(&inner.name),
+            escape(&inner.path),
+            escape(&outer.name),
+            escape(&outer.path)
+        ));
+    }
+    let by_name: Vec<_> = projects
+        .iter()
+        .map(|(info, _)| (PathBuf::from(info.name.to_ascii_lowercase()), info))
+        .collect();
+    if let Some((outer, inner)) = nested(&by_name) {
+        return Err(format!(
+            "project name '{}' is the same as or inside '{}', and names are worktree \
+             destinations",
+            escape(&inner.name),
+            escape(&outer.name)
+        ));
+    }
+    Ok(())
+}
+
+/// The first pair whose keys are equal or nested, outer first.
+fn nested<'a>(keyed: &[(PathBuf, &'a ProjectInfo)]) -> Option<(&'a ProjectInfo, &'a ProjectInfo)> {
+    for (i, (outer_key, outer)) in keyed.iter().enumerate() {
+        for (inner_key, inner) in keyed.iter().skip(i + 1) {
+            if inner_key.starts_with(outer_key) {
+                return Some((outer, inner));
+            }
+            if outer_key.starts_with(inner_key) {
+                return Some((inner, outer));
+            }
+        }
+    }
+    None
+}
+
+/// What is wrong with a name or path component, if anything. The same
+/// `.meta` serves every platform, so each must name one and the same
+/// directory everywhere:
+/// - only ASCII letters, digits, space and `._-+@`, which no filesystem
+///   folds, normalizes or treats specially (Unicode names can alias each
+///   other on macOS and Windows; `<>:"|?*` and `C:` mean something on Windows);
+/// - no trailing dot or space, which Windows drops (`a.` is `a` there);
+/// - not a Windows device name such as `NUL` or `COM1`;
+/// - not `.git`, which would put a repo inside a git directory (hooks).
+fn component_problem(part: &str) -> Option<&'static str> {
+    if !part
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '+' | '@'))
+    {
+        return Some("a character other than ASCII letters, digits, space and ._-+@");
+    }
+    if part.ends_with(['.', ' ']) {
+        return Some("a trailing dot or space, which Windows drops");
+    }
+    let stem = part
+        .split('.')
+        .next()
+        .unwrap_or(part)
+        .trim_end()
+        .to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        stem.strip_prefix(prefix)
+            .is_some_and(|n| n.len() == 1 && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT")
+    {
+        return Some("a Windows device name");
+    }
+    if part.eq_ignore_ascii_case(".git") {
+        return Some("the name .git");
+    }
+    None
+}
+
+/// Normalize a project path to `a/b` form, rejecting anything that is not a
+/// plain relative path below the config's directory.
+fn normalize_project_path(raw: &str) -> Result<String, String> {
+    let unified = raw.replace('\\', "/");
+    if unified.starts_with('/') {
+        return Err(format!("path '{}' must be relative", escape(raw)));
+    }
+    let mut parts = Vec::new();
+    for part in unified.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return Err(format!("path '{}' must not contain '..'", escape(raw))),
+            part => match component_problem(part) {
+                Some(why) => {
+                    return Err(format!("path '{}' has a component with {why}", escape(raw)))
+                }
+                None => parts.push(part),
+            },
+        }
+    }
+    if parts.is_empty() {
+        return Err(format!(
+            "path '{}' must name a directory below the .meta file",
+            escape(raw)
+        ));
+    }
+    Ok(parts.join("/"))
+}
+
+/// Resolve `rel` below `base_dir` through the symlinks that exist now, and
+/// refuse it if one leads outside `base_dir` or if it ends at `base_dir`.
+/// Returns the project's location: the real path of the part that exists,
+/// followed by the part not created yet.
+pub fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
+    let base = base_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", escape_path(base_dir)))?;
+    if rel.starts_with('/') || rel.split('/').any(|part| matches!(part, "" | "." | "..")) {
+        return Err(format!("path '{rel}' must be a plain relative path"));
+    }
+    let mut current = base.clone();
+    let mut exists = true;
+    for part in rel.split('/') {
+        current.push(part);
+        if !exists {
+            continue;
+        }
+        match current.symlink_metadata() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => exists = false,
+            // What can't be examined (no permission, say) may hold a
+            // symlink out, so it is refused rather than taken as missing
+            Err(e) => {
+                return Err(format!(
+                    "path '{rel}' cannot be checked at '{}': {e}",
+                    escape_path(&current)
+                ))
+            }
+            Ok(meta) if meta.file_type().is_symlink() => match current.canonicalize() {
+                Ok(target) if target.starts_with(&base) => current = target,
+                Ok(_) => {
+                    return Err(format!(
+                        "path '{rel}' leads outside {} through the symlink '{}'",
+                        escape_path(&base),
+                        escape_path(&current)
+                    ))
+                }
+                // Its target may not exist yet, but where it would lead
+                // cannot be checked, so it is refused
+                Err(e) => {
+                    return Err(format!(
+                        "path '{rel}' goes through the symlink '{}', which cannot be resolved: {e}",
+                        escape_path(&current)
+                    ))
+                }
+            },
+            Ok(_) => {}
+        }
+    }
+    if current == base {
+        return Err(format!(
+            "path '{rel}' leads to the directory of the .meta file itself"
+        ));
+    }
+    Ok(current)
 }
 
 /// Load defaults from a meta config file.
 /// Returns MetaDefaults::default() if no config found or on parse error.
 pub fn load_meta_defaults(start_dir: &Path) -> MetaDefaults {
-    let Some((config_path, _format)) = find_meta_config_in(start_dir) else {
+    let Ok(Some((config_path, _format))) = find_meta_config_in(start_dir) else {
         return MetaDefaults::default();
     };
 
@@ -266,16 +679,26 @@ pub fn walk_meta_tree(
     max_depth: Option<usize>,
 ) -> anyhow::Result<Vec<MetaTreeNode>> {
     let (config_path, _format) = find_meta_config(start_dir, None)
-        .ok_or_else(|| anyhow::anyhow!("No .meta config found in {}", start_dir.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("No .meta config found in {}", escape_path(start_dir)))?;
 
     let (projects, _ignore) = parse_meta_config(&config_path)?;
     let meta_dir = config_path.parent().unwrap_or(Path::new("."));
+    walk_projects(meta_dir, &projects, max_depth)
+}
 
+/// The meta tree whose top level is `projects`, the parsed config in
+/// `meta_dir` (such as one chosen with `--config`), walked like
+/// [`walk_meta_tree`]. A nested config that fails to parse is an error.
+pub fn walk_projects(
+    meta_dir: &Path,
+    projects: &[ProjectInfo],
+    max_depth: Option<usize>,
+) -> anyhow::Result<Vec<MetaTreeNode>> {
     let mut visited = std::collections::HashSet::new();
     visited.insert(meta_dir.canonicalize().unwrap_or(meta_dir.to_path_buf()));
 
     let depth = max_depth.unwrap_or(usize::MAX);
-    Ok(walk_inner(meta_dir, &projects, depth, 0, &mut visited))
+    walk_inner(meta_dir, projects, depth, 0, &mut visited)
 }
 
 /// Flatten a meta tree into fully-qualified path strings.
@@ -418,43 +841,40 @@ fn walk_inner(
     max_depth: usize,
     current_depth: usize,
     visited: &mut std::collections::HashSet<PathBuf>,
-) -> Vec<MetaTreeNode> {
+) -> anyhow::Result<Vec<MetaTreeNode>> {
     let mut nodes = Vec::new();
 
     for project in projects {
         let project_dir = base_dir.join(&project.path);
 
         // Check if this project has its own .meta file directly in its directory
-        let has_meta = project_dir.is_dir()
-            && find_meta_config(&project_dir, None)
-                .map(|(path, _)| path.parent().map(|p| p == project_dir).unwrap_or(false))
-                .unwrap_or(false);
-
-        // Recurse into children if within depth limit and this is a meta repo
-        let children = if has_meta && current_depth < max_depth {
-            let canonical = project_dir.canonicalize().unwrap_or(project_dir.clone());
-            if visited.insert(canonical) {
-                if let Some((nested_config_path, _)) = find_meta_config(&project_dir, None) {
-                    if let Ok((nested_projects, _)) = parse_meta_config(&nested_config_path) {
-                        walk_inner(
-                            &project_dir,
-                            &nested_projects,
-                            max_depth,
-                            current_depth + 1,
-                            visited,
-                        )
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![] // Cycle detected
-            }
+        // Past the depth limit it is never read, so a config that can't be
+        // examined only stops a walk that would recurse into it
+        let nested_config = if current_depth < max_depth {
+            find_meta_config_in(&project_dir)?
         } else {
-            vec![]
+            find_meta_config_in(&project_dir).ok().flatten()
         };
+        let has_meta = nested_config.is_some();
+
+        // Recurse into children if within depth limit and this is a meta repo.
+        // A nested config that fails to parse or validate is an error, not an
+        // empty subtree: skipping it would silently drop its repos.
+        let mut children = vec![];
+        if let Some((nested_config_path, _)) = nested_config {
+            let canonical = project_dir.canonicalize().unwrap_or(project_dir.clone());
+            // `visited` stops cycles through symlinks
+            if current_depth < max_depth && visited.insert(canonical) {
+                let (nested_projects, _) = parse_meta_config(&nested_config_path)?;
+                children = walk_inner(
+                    &project_dir,
+                    &nested_projects,
+                    max_depth,
+                    current_depth + 1,
+                    visited,
+                )?;
+            }
+        }
 
         nodes.push(MetaTreeNode {
             info: project.clone(),
@@ -464,7 +884,7 @@ fn walk_inner(
     }
 
     nodes.sort_by(|a, b| a.info.name.cmp(&b.info.name));
-    nodes
+    Ok(nodes)
 }
 
 #[cfg(test)]
@@ -558,16 +978,14 @@ mod tests {
     }
 
     #[test]
-    fn test_walk_meta_tree_cycle_detection() {
+    fn test_walk_meta_tree_rejects_symlink_cycles() {
+        // A nested project that links back to its own meta dir (or any
+        // ancestor) is refused, so the walk cannot loop
         let dir = tempfile::tempdir().unwrap();
         let child = dir.path().join("child");
         std::fs::create_dir(&child).unwrap();
-
-        // Create a symlink from child/loop back to root
         #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir.path(), child.join("loop")).unwrap();
-        }
+        std::os::unix::fs::symlink(&child, child.join("loop")).unwrap();
 
         std::fs::write(
             dir.path().join(".meta"),
@@ -580,14 +998,14 @@ mod tests {
         )
         .unwrap();
 
-        // Should not infinite loop - cycle detection stops recursion
-        let tree = walk_meta_tree(dir.path(), None).unwrap();
-        let paths = flatten_meta_tree(&tree);
-        assert!(paths.contains(&"child".to_string()));
-        // The cycle node is included but has no children
-        assert!(paths.contains(&"child/loop".to_string()));
-        let child_node = &tree[0];
-        assert!(child_node.children[0].children.is_empty());
+        #[cfg(unix)]
+        {
+            let err = walk_meta_tree(dir.path(), None).unwrap_err().to_string();
+            assert!(
+                err.contains("leads to the directory of the .meta file itself"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -1030,32 +1448,504 @@ mod tests {
     }
 
     #[test]
-    fn test_walk_meta_tree_handles_malformed_nested_meta() {
-        // When a nested .meta file is malformed, we should skip it gracefully
+    fn test_walk_meta_tree_fails_on_malformed_nested_meta() {
+        // A broken nested .meta must surface, not silently drop its repos
         let dir = tempfile::tempdir().unwrap();
         let vendor = dir.path().join("vendor");
         std::fs::create_dir(&vendor).unwrap();
-
-        // Root .meta is valid
         std::fs::write(
             dir.path().join(".meta"),
             r#"{"projects": {"vendor": {"repo": "git@github.com:org/vendor.git", "meta": true}}}"#,
         )
         .unwrap();
-
-        // Nested .meta is malformed JSON
         std::fs::write(
             vendor.join(".meta"),
-            r#"{"projects": {this is not valid json}"#,
+            r#"{"projects": {"x": {"path": "../../escape"}}}"#,
         )
         .unwrap();
 
-        // Should still return the tree without the nested children
-        let tree = walk_meta_tree(dir.path(), None).unwrap();
-        assert_eq!(tree.len(), 1);
-        assert_eq!(tree[0].info.name, "vendor");
-        // Children should be empty because the nested .meta was malformed
-        assert_eq!(tree[0].children.len(), 0);
+        let err = walk_meta_tree(dir.path(), None).unwrap_err().to_string();
+        assert!(err.contains("Invalid project 'x'"), "{err}");
+        assert!(err.contains("vendor"), "{err}");
+    }
+
+    fn parse_err_in(dir: &Path, json: &str) -> String {
+        std::fs::write(dir.join(".meta"), json).unwrap();
+        parse_meta_config(&dir.join(".meta"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    fn parse_err(json: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        parse_err_in(dir.path(), json)
+    }
+
+    #[test]
+    fn test_parse_rejects_paths_outside_the_workspace() {
+        for path in [
+            "../../dropped",
+            "a/../../b",
+            "/abs/dir",
+            "C:/x",
+            "C:x",
+            "\\\\host\\s",
+            ".",
+            "./",
+        ] {
+            let err = parse_err(&format!(
+                r#"{{"projects": {{"p": {{"repo": "u", "path": {path:?}}}}}}}"#
+            ));
+            assert!(err.contains("Invalid project 'p' in "), "{path}: {err}");
+            assert!(err.contains(".meta: path"), "{path}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_bad_names_tags_and_repos() {
+        for (json, what) in [
+            (
+                r#"{"projects": {"../../../../escaped-wt": {"repo": "u", "path": "a"}}}"#,
+                "name: path '../../../../escaped-wt' must not contain '..'",
+            ),
+            (
+                r#"{"projects": {"/abs": "u"}}"#,
+                "name: path '/abs' must be relative",
+            ),
+            (r#"{"projects": {"a//b": "u"}}"#, "plain relative path"),
+            (
+                r#"{"projects": {"..": {"repo": "u", "path": "a"}}}"#,
+                "must not contain '..'",
+            ),
+            (
+                r#"{"projects": {"x\u001b]0;T\u0007": "u"}}"#,
+                "control characters",
+            ),
+            (
+                r#"{"projects": {"a": {"repo": "u", "tags": ["n\nfake"]}}}"#,
+                "control characters",
+            ),
+            (
+                r#"{"projects": {"a": {"repo": "u", "tags": ["a,b"]}}}"#,
+                "whitespace or ','",
+            ),
+            (
+                r#"{"projects": {"a": {"repo": "u", "tags": [""]}}}"#,
+                "tag is empty",
+            ),
+            (
+                r#"{"projects": {"a": "--upload-pack=touch x"}}"#,
+                "must not start with '-'",
+            ),
+            (
+                r#"{"projects": {"a": {"repo": "u", "path": "t\u001b[2J"}}}"#,
+                "control characters",
+            ),
+        ] {
+            let err = parse_err(json);
+            assert!(err.contains(what), "{json}: {err}");
+            // The offending value is escaped in the message itself
+            assert!(!err.contains('\u{1b}'), "{json}: {err}");
+        }
+    }
+
+    /// Whether a directory with mode 000 still can't be entered here (as
+    /// root it can, and permission tests have nothing to check).
+    #[cfg(unix)]
+    fn locked_dir(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::read_dir(path).is_err()
+    }
+
+    #[cfg(unix)]
+    fn unlock_dir(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_a_path_through_a_directory_it_cannot_examine() {
+        // `locked` may hold a symlink out; not being able to look is no
+        // proof that the rest of the path does not exist yet
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        if !locked_dir(&locked) {
+            return;
+        }
+        let err = parse_err_in(
+            dir.path(),
+            r#"{"projects": {"p": {"repo": "u", "path": "locked/x"}}}"#,
+        );
+        unlock_dir(&locked);
+        assert!(err.contains("cannot be checked at"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_fails_on_a_nested_config_it_cannot_read() {
+        // group/.meta links into a directory that can't be entered: the walk
+        // must fail rather than leave group's repos out
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("group/core")).unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"group": {"repo": "u", "meta": true}}}"#,
+        )
+        .unwrap();
+        let private = dir.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(
+            private.join("config.json"),
+            r#"{"projects": {"core": "u"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../private/config.json", dir.path().join("group/.meta"))
+            .unwrap();
+        assert!(walk_meta_tree(dir.path(), None).is_ok());
+        if !locked_dir(&private) {
+            return;
+        }
+        let result = walk_meta_tree(dir.path(), None);
+        unlock_dir(&private);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Cannot read") && err.contains(".meta"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_overlap_through_symlink_alias() {
+        // `alias` points at `real`, so `alias/outer/link/x` sits inside
+        // `real/outer`, whose clone could plant `link` pointing anywhere.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("alias")).unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"outer": {"repo": "u", "path": "real/outer"}, "inner": {"repo": "u", "path": "alias/outer/link/x"}}}"#,
+        )
+        .unwrap();
+        let err = parse_meta_config(&dir.path().join(".meta"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "project 'inner' (path 'alias/outer/link/x') is at or inside project 'outer'"
+            ),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_reserved_dirs_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join(".git"), dir.path().join("alias")).unwrap();
+        let err = parse_err_in(
+            dir.path(),
+            r#"{"projects": {"p": {"repo": "u", "path": "alias/hooks"}}}"#,
+        );
+        assert!(err.contains("leads into .git or .worktrees"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_allows_symlink_alias_of_the_workspace_itself() {
+        // `here -> .` is harmless as a step on the way; only ending at the
+        // config's own directory is refused
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("here")).unwrap();
+        let meta = dir.path().join(".meta");
+        std::fs::write(
+            &meta,
+            r#"{"projects": {"svc": {"repo": "u", "path": "here/service"}}}"#,
+        )
+        .unwrap();
+        assert!(parse_meta_config(&meta).is_ok());
+
+        std::fs::write(
+            &meta,
+            r#"{"projects": {"svc": {"repo": "u", "path": "here"}}}"#,
+        )
+        .unwrap();
+        let err = parse_meta_config(&meta).unwrap_err().to_string();
+        assert!(
+            err.contains("leads to the directory of the .meta file itself"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)] // Windows refuses control characters in file names
+    #[test]
+    fn test_config_errors_escape_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws\nfake line\u{1b}[2J");
+        std::fs::create_dir(&ws).unwrap();
+        std::fs::write(ws.join(".meta"), "{not json").unwrap();
+        let err = format!("{:#}", parse_meta_config(&ws.join(".meta")).unwrap_err());
+        assert!(!err.contains('\n') && !err.contains('\u{1b}'), "{err}");
+        assert!(err.contains("ws\\nfake line\\u{1b}[2J"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_rejects_drive_prefixes_anywhere() {
+        for json in [
+            r#"{"projects": {"p": {"repo": "u", "path": "./C:/outside"}}}"#,
+            r#"{"projects": {"p": {"repo": "u", "path": "a/C:b"}}}"#,
+            r#"{"projects": {"C:outside": {"repo": "u", "path": "safe"}}}"#,
+        ] {
+            let err = parse_err(json);
+            assert!(err.contains("ASCII letters"), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_names_and_paths_that_alias_or_mislead() {
+        for (json, what) in [
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "a./x"}}}"#,
+                "trailing dot",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "a /x"}}}"#,
+                "trailing dot or space",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "x/nul"}}}"#,
+                "device name",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "con.txt"}}}"#,
+                "device name",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "x/com1"}}}"#,
+                "device name",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "C:x"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "ab:c"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "PROGRA~1/x"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "caf\u00e9"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "cafe\u0301"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "COM\u00b9"}}}"#,
+                "ASCII letters",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": ".git/hooks"}}}"#,
+                "the name .git",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "x/.GIT/hooks"}}}"#,
+                "the name .git",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": ".worktrees/t"}}}"#,
+                "inside .worktrees",
+            ),
+            (
+                r#"{"projects": {"p": {"repo": "u", "path": "sets/x"}}, "worktrees_dir": "sets"}"#,
+                "inside sets",
+            ),
+            (
+                r#"{"projects": {".worktrees/b": {"repo": "u", "path": "b"}}, "worktrees_dir": "sets"}"#,
+                "inside sets",
+            ),
+            (r#"{"projects": {"x|y": "u"}}"#, "ASCII letters"),
+            (
+                r#"{"projects": {"a.": {"repo": "u", "path": "b"}}}"#,
+                "trailing dot",
+            ),
+        ] {
+            let err = parse_err(json);
+            assert!(err.contains(what), "{json}: {err}");
+        }
+        // Ordinary names that only look similar are fine
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"console": "u", "a.b": "u", "com10": "u", "x y+z@w": "u", ".github": "u"}}"#,
+        )
+        .unwrap();
+        assert!(parse_meta_config(&dir.path().join(".meta")).is_ok());
+    }
+
+    #[test]
+    fn test_parse_rejects_overlapping_paths() {
+        let err = parse_err(
+            r#"{"projects": {"outer": {"repo": "u", "path": "a"}, "inner": {"repo": "u", "path": "a/link/x"}}}"#,
+        );
+        assert!(
+            err.contains("project 'inner' (path 'a/link/x') is at or inside project 'outer'"),
+            "{err}"
+        );
+
+        let err = parse_err(
+            r#"{"projects": {"one": {"repo": "u", "path": "x"}, "two": {"repo": "u", "path": "./x/"}}}"#,
+        );
+        assert!(
+            err.contains("project 'two' (path 'x') is at or inside project 'one'"),
+            "{err}"
+        );
+
+        // Case differences don't separate paths (some filesystems ignore case)
+        let err = parse_err(
+            r#"{"projects": {"one": {"repo": "u", "path": "Lib"}, "two": {"repo": "u", "path": "lib/x"}}}"#,
+        );
+        assert!(err.contains("is at or inside project 'one'"), "{err}");
+
+        // A shared name prefix is not nesting
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"a": "u", "a-b": "u", "ab": {"repo": "u", "path": "a.b/c"}}}"#,
+        )
+        .unwrap();
+        assert!(parse_meta_config(&dir.path().join(".meta")).is_ok());
+    }
+
+    #[test]
+    fn test_parse_accepts_nested_alias_names() {
+        // as gitkb's .meta.yaml lists `vendor/tree-sitter-markdown`
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".meta.yaml"),
+            "projects:\n  core: u\n  vendor/tree-sitter-markdown: u\n",
+        )
+        .unwrap();
+        let (projects, _) = parse_meta_config(&dir.path().join(".meta.yaml")).unwrap();
+        assert_eq!(projects[1].name, "vendor/tree-sitter-markdown");
+        assert_eq!(projects[1].path, "vendor/tree-sitter-markdown");
+    }
+
+    #[test]
+    fn test_relative_dir_stays_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(relative_dir(dir.path(), "wt").unwrap(), "wt");
+        let inside = dir.path().join("custom").to_string_lossy().into_owned();
+        assert_eq!(relative_dir(dir.path(), &inside).unwrap(), "custom");
+        let deeper = dir
+            .path()
+            .join("build/worktrees")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            relative_dir(dir.path(), &deeper).unwrap(),
+            "build/worktrees"
+        );
+        assert!(relative_dir(dir.path(), "../out").is_err());
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(dir.path().join(".git")).unwrap();
+            std::os::unix::fs::symlink(dir.path().join(".git"), dir.path().join("storage"))
+                .unwrap();
+            assert!(relative_dir(dir.path(), "storage")
+                .unwrap_err()
+                .contains("leads into .git"));
+        }
+        // a value from the config is escaped in the message
+        let err = relative_dir(dir.path(), "../bad\nFORGED").unwrap_err();
+        assert!(!err.contains('\n') && err.contains("bad\\nFORGED"), "{err}");
+        assert!(relative_dir(dir.path(), "/").is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_nesting_or_colliding_names() {
+        let err = parse_err(
+            r#"{"projects": {"a": {"repo": "u", "path": "x"}, "a/b": {"repo": "u", "path": "y"}}}"#,
+        );
+        assert!(
+            err.contains("project name 'a/b' is the same as or inside 'a'"),
+            "{err}"
+        );
+        let err = parse_err(
+            r#"{"projects": {"API": {"repo": "u", "path": "x"}, "api": {"repo": "u", "path": "y"}}}"#,
+        );
+        assert!(err.contains("is the same as or inside"), "{err}");
+        let err = parse_err(
+            r#"{"projects": {"app": {"repo": "u", "path": "app"}}, "worktrees_dir": "app/wt"}"#,
+        );
+        assert!(err.contains("is inside project 'app'"), "{err}");
+        let err = parse_err(r#"{"projects": {}, "worktrees_dir": "../out"}"#);
+        assert!(err.contains("Invalid worktrees_dir"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_projects_where_the_worktree_root_resolves() {
+        // .worktrees is a symlink to storage/, so storage/review is in it
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("storage")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("storage"), dir.path().join(".worktrees"))
+            .unwrap();
+        let err = parse_err_in(
+            dir.path(),
+            r#"{"projects": {"app": {"repo": "u", "path": "storage/review"}}}"#,
+        );
+        assert!(err.contains("through a symlink"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_normalizes_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"a": {"repo": "u", "path": "./third_party//vendor/"}, "b": {"repo": "u", "path": "x\\y"}}}"#,
+        )
+        .unwrap();
+        let (projects, _) = parse_meta_config(&dir.path().join(".meta")).unwrap();
+        assert_eq!(projects[0].path, "third_party/vendor");
+        assert_eq!(projects[1].path, "x/y");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("inside")).unwrap();
+        let meta = dir.path().join(".meta");
+
+        for path in ["link", "link/sub"] {
+            std::fs::write(
+                &meta,
+                format!(r#"{{"projects": {{"p": {{"repo": "u", "path": "{path}"}}}}}}"#),
+            )
+            .unwrap();
+            let err = parse_meta_config(&meta).unwrap_err().to_string();
+            assert!(err.contains("through the symlink"), "{path}: {err}");
+        }
+
+        // A symlink that stays inside the workspace is fine
+        std::fs::write(
+            &meta,
+            r#"{"projects": {"p": {"repo": "u", "path": "inside/sub"}}}"#,
+        )
+        .unwrap();
+        assert!(parse_meta_config(&meta).is_ok());
     }
 
     #[test]
@@ -1177,11 +2067,14 @@ mod tests {
     fn test_meta_directory_is_not_config() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".meta/skills")).unwrap();
-        assert!(find_meta_config_in(dir.path()).is_none());
+        assert!(find_meta_config_in(dir.path()).unwrap().is_none());
 
         std::fs::write(dir.path().join(".meta.yaml"), "projects: {}\n").unwrap();
         let expected = dir.path().join(".meta.yaml");
-        assert_eq!(find_meta_config_in(dir.path()).unwrap().0, expected);
+        assert_eq!(
+            find_meta_config_in(dir.path()).unwrap().unwrap().0,
+            expected
+        );
         assert_eq!(find_meta_config(dir.path(), None).unwrap().0, expected);
     }
 
