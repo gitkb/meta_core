@@ -16,7 +16,7 @@ use std::fmt::Write;
 /// paragraph separators (U+2028-9), which many renderers treat as line
 /// breaks; and invisible characters that hide text from a reader or make one
 /// value look like another (soft hyphen, combining grapheme joiner, Hangul
-/// fillers, Mongolian vowel separator, zero-width characters, word joiners
+/// fillers, Mongolian vowel separator, zero-width characters (not the joiner, which emoji sequences use), word joiners
 /// and deprecated format controls, BOM, interlinear
 /// annotation controls, tag characters).
 pub fn is_unsafe_char(c: char) -> bool {
@@ -28,7 +28,8 @@ pub fn is_unsafe_char(c: char) -> bool {
                 | '\u{061C}'
                 | '\u{115F}'..='\u{1160}'
                 | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
+                | '\u{200B}'..='\u{200C}'
+                | '\u{200E}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{206F}'
                 | '\u{3164}'
@@ -109,6 +110,10 @@ mod tests {
         );
         // Emoji keep their variation selector
         assert!(matches!(escape("ok \u{2714}\u{fe0f}"), Cow::Borrowed(_)));
+        assert!(matches!(
+            escape("\u{1f468}\u{200d}\u{1f467}"),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

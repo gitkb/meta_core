@@ -123,6 +123,41 @@ pub fn find_meta_config_in(dir: &Path) -> Option<(PathBuf, ConfigFormat)> {
     None
 }
 
+/// The config file directly in project directory `dir`, for walking the
+/// meta tree. Only a missing directory or file means there is none: one
+/// that cannot be examined (no permission, a link whose target is out of
+/// reach) is an error, since skipping it would silently drop its repos.
+/// A `.meta` directory (the plugins folder) is not a config.
+fn nested_config_in(dir: &Path) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+    let unreadable =
+        |path: &Path, e: std::io::Error| anyhow::anyhow!("Cannot read {}: {e}", escape_path(path));
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(dir, e)),
+    }
+    for (name, format) in &[
+        (".meta", ConfigFormat::Json),
+        (".meta.json", ConfigFormat::Json),
+        (".meta.yaml", ConfigFormat::Yaml),
+        (".meta.yml", ConfigFormat::Yaml),
+    ] {
+        let candidate = dir.join(name);
+        match std::fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(unreadable(&candidate, e)),
+            Ok(_) => {}
+        }
+        match std::fs::metadata(&candidate) {
+            Ok(meta) if meta.is_file() => return Ok(Some((candidate, format.clone()))),
+            Ok(_) => continue,
+            Err(e) => return Err(unreadable(&candidate, e)),
+        }
+    }
+    Ok(None)
+}
+
 /// Find the meta config file, checking for .meta, .meta.yaml, and .meta.yml
 ///
 /// Walks up from `start_dir` to the filesystem root, looking for config files.
@@ -823,12 +858,7 @@ fn walk_inner(
         let project_dir = base_dir.join(&project.path);
 
         // Check if this project has its own .meta file directly in its directory
-        let nested_config = if project_dir.is_dir() {
-            find_meta_config(&project_dir, None)
-                .filter(|(path, _)| path.parent() == Some(project_dir.as_path()))
-        } else {
-            None
-        };
+        let nested_config = nested_config_in(&project_dir)?;
         let has_meta = nested_config.is_some();
 
         // Recurse into children if within depth limit and this is a meta repo.
@@ -1521,6 +1551,74 @@ mod tests {
             // The offending value is escaped in the message itself
             assert!(!err.contains('\u{1b}'), "{json}: {err}");
         }
+    }
+
+    /// Whether a directory with mode 000 still can't be entered here (as
+    /// root it can, and permission tests have nothing to check).
+    #[cfg(unix)]
+    fn locked_dir(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::read_dir(path).is_err()
+    }
+
+    #[cfg(unix)]
+    fn unlock_dir(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_rejects_a_path_through_a_directory_it_cannot_examine() {
+        // `locked` may hold a symlink out; not being able to look is no
+        // proof that the rest of the path does not exist yet
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        if !locked_dir(&locked) {
+            return;
+        }
+        let err = parse_err_in(
+            dir.path(),
+            r#"{"projects": {"p": {"repo": "u", "path": "locked/x"}}}"#,
+        );
+        unlock_dir(&locked);
+        assert!(err.contains("cannot be checked at"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_fails_on_a_nested_config_it_cannot_read() {
+        // group/.meta links into a directory that can't be entered: the walk
+        // must fail rather than leave group's repos out
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("group/core")).unwrap();
+        std::fs::write(
+            dir.path().join(".meta"),
+            r#"{"projects": {"group": {"repo": "u", "meta": true}}}"#,
+        )
+        .unwrap();
+        let private = dir.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(
+            private.join("config.json"),
+            r#"{"projects": {"core": "u"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../private/config.json", dir.path().join("group/.meta"))
+            .unwrap();
+        assert!(walk_meta_tree(dir.path(), None).is_ok());
+        if !locked_dir(&private) {
+            return;
+        }
+        let result = walk_meta_tree(dir.path(), None);
+        unlock_dir(&private);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Cannot read") && err.contains(".meta"),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]
