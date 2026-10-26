@@ -199,9 +199,48 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
         )
     })?;
 
+    #[derive(Deserialize)]
+    struct CheckedConfig {
+        #[serde(default, deserialize_with = "unique_projects")]
+        projects: HashMap<String, ProjectEntry>,
+        #[serde(flatten)]
+        config: MetaConfig,
+    }
+
+    fn unique_projects<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<String, ProjectEntry>, D::Error> {
+        struct ProjectsVisitor;
+        impl<'de> serde::de::Visitor<'de> for ProjectsVisitor {
+            type Value = HashMap<String, ProjectEntry>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map of unique project keys")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut projects = HashMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if projects.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate project key '{}'",
+                            escape(&key)
+                        )));
+                    }
+                    projects.insert(key, map.next_value()?);
+                }
+                Ok(projects)
+            }
+        }
+        deserializer.deserialize_map(ProjectsVisitor)
+    }
+
     // Determine format from file extension
     let path_str = meta_path.to_string_lossy();
-    let config: MetaConfig = if path_str.ends_with(".yaml") || path_str.ends_with(".yml") {
+    let checked: CheckedConfig = if path_str.ends_with(".yaml") || path_str.ends_with(".yml") {
         serde_yaml_ng::from_str(&config_str).with_context(|| {
             format!(
                 "Failed to parse YAML config file: {}",
@@ -216,6 +255,9 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
             )
         })?
     };
+
+    let mut config = checked.config;
+    config.projects = checked.projects;
 
     // Convert project entries to normalized, validated ProjectInfo
     // in name order, so the first bad entry reported is always the same one
@@ -2091,5 +2133,28 @@ mod tests {
 
         let tree = walk_meta_tree(dir.path(), None).unwrap();
         assert!(!tree[0].is_meta);
+    }
+}
+
+#[cfg(test)]
+mod duplicate_project_tests {
+    #[test]
+    fn duplicate_project_keys_name_file_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, content) in [
+            (".meta", r#"{"projects":{"dup":"first","dup":"second"}}"#),
+            (
+                ".meta.json",
+                r#"{"projects":{"dup":"first","dup":"second"}}"#,
+            ),
+            (".meta.yaml", "projects:\n  dup: first\n  dup: second\n"),
+            (".meta.yml", "projects:\n  dup: first\n  dup: second\n"),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::write(&path, content).unwrap();
+            let err = format!("{:#}", super::parse_meta_config(&path).unwrap_err());
+            assert!(err.contains(file), "{err}");
+            assert!(err.contains("duplicate project key 'dup'"), "{err}");
+        }
     }
 }
