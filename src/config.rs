@@ -461,7 +461,7 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 /// - No value (name, path, repo, tags, provides, depends_on) is empty or holds
 ///   a control or bidirectional-control character ([`is_unsafe_char`]).
 /// - `name` is a relative path in normal form (usually one component; a
-///   nested alias like `vendor/lib` is a worktree destination too), held to
+///   nested alias like `vendor/lib` names a nested repo), held to
 ///   the same rules as `path`.
 /// - The name and every path component pass [`component_problem`]: ASCII
 ///   letters, digits, space and `._-+@` only, no trailing dot or space, no
@@ -505,8 +505,8 @@ fn validate_project(
         }
     }
     // A name may be a relative path, such as `vendor/lib` for a nested
-    // repo: worktrees put the project at `<worktree>/<name>`. So it follows
-    // the path rules, and must already be in their normal form.
+    // repo, and names a project in commands. So it follows the path rules,
+    // and must already be in their normal form.
     let normal = normalize_project_path(&info.name).map_err(|why| format!("name: {why}"))?;
     if normal != info.name {
         return Err(format!(
@@ -610,8 +610,8 @@ pub fn relative_dir(base_dir: &Path, raw: &str) -> Result<String, String> {
 /// through existing symlinks, and without case, which some filesystems
 /// ignore. A repo inside another belongs in a nested `.meta` (`meta: true`).
 fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
-    // Paths, by where they resolve; and names, which worktrees use as
-    // destinations (`<worktree>/<name>`)
+    // Paths, by where they resolve; and names, which must name one project
+    // each in commands
     let by_location: Vec<_> = projects
         .iter()
         .map(|(info, location)| {
@@ -637,8 +637,7 @@ fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
         .collect();
     if let Some((outer, inner)) = nested(&by_name) {
         return Err(format!(
-            "project name '{}' is the same as or inside '{}', and names are worktree \
-             destinations",
+            "project name '{}' is the same as or inside '{}'; names must not overlap",
             escape(&inner.name),
             escape(&outer.name)
         ));
