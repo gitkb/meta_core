@@ -228,25 +228,33 @@ pub fn find_meta_config(
 /// first and its root last: `meta_dir`, then each meta directory above it
 /// whose own project list names the one before. A meta directory its parent
 /// doesn't list (or whose parent's config can't be read) is a workspace of
-/// its own. A checkout in a worktree set meta made belongs to the workspace
-/// the set was made from ([`set_origin`]), which follows it in the list.
+/// its own. In a worktree set meta made, the set's own meta directories come
+/// first, then those of the checkout it stands for ([`set_source`]) and its
+/// workspace.
 pub fn workspace_meta_dirs(meta_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = listed_chain(meta_dir);
+    // A checkout in a set meta made goes on with the checkout it stands for
+    let source = dirs.iter().find_map(|dir| {
+        set_source(dir).filter(|source| matches!(find_meta_config_in(source), Ok(Some(_))))
+    });
+    for dir in source.as_deref().map(listed_chain).unwrap_or_default() {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// `meta_dir`, then each meta directory above it whose own project list
+/// names the one before.
+fn listed_chain(meta_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![meta_dir.to_path_buf()];
-    while let Some(dir) = dirs.last().cloned() {
-        let parent = dir
-            .ancestors()
-            .skip(1)
-            .find_map(|parent| match find_meta_config_in(parent) {
-                Ok(None) => None,
-                Ok(Some((config, _))) => Some(lists(&config, &dir).then(|| parent.to_path_buf())),
-                Err(_) => Some(None),
-            });
-        // Above the top of a set's checkouts, its origin's workspace goes on
-        let next = parent.flatten().or_else(|| {
-            set_origin(&dir).filter(|origin| matches!(find_meta_config_in(origin), Ok(Some(_))))
-        });
-        match next {
-            Some(next) if !dirs.contains(&next) => dirs.push(next),
+    for parent in meta_dir.ancestors().skip(1) {
+        match find_meta_config_in(parent) {
+            Ok(None) => continue,
+            Ok(Some((config, _))) if dirs.last().is_some_and(|dir| lists(&config, dir)) => {
+                dirs.push(parent.to_path_buf())
+            }
             _ => break,
         }
     }
@@ -282,18 +290,24 @@ fn lists(config: &Path, dir: &Path) -> bool {
 /// made the worktree for.
 pub const WORKTREE_RECORD_FILE: &str = "meta-worktree.json";
 
-/// The meta directory a worktree set was made from, when `dir` is a checkout
-/// in a set meta made: the `project` in meta's record in the checkout's git
-/// admin directory (`<repo>/.git/worktrees/<id>/`, which its `.git` file
-/// names). A worktree made by hand has no record and is a checkout of its own,
-/// as a second workspace can be. Git's shared repository doesn't say which
-/// checkout made the set, so only the record is used.
-pub fn set_origin(dir: &Path) -> Option<PathBuf> {
+/// The checkout that `dir`, a checkout in a worktree set meta made, stands
+/// for: the `project` the set was made from joined with `dir`'s place in
+/// the set (`<project>/child` for `<set>/child`), from meta's record in the
+/// checkout's git admin directory (`<repo>/.git/worktrees/<id>/`, which its
+/// `.git` file names). A worktree made by hand has no record and stands for
+/// itself, as a second workspace can. Git's shared repository doesn't say
+/// which checkout made the set, so only the record is used.
+pub fn set_source(dir: &Path) -> Option<PathBuf> {
     let gitfile = std::fs::read_to_string(dir.join(".git")).ok()?;
     let admin = dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim());
     let record = std::fs::read_to_string(admin.join(WORKTREE_RECORD_FILE)).ok()?;
     let record: serde_json::Value = serde_json::from_str(&record).ok()?;
-    record.get("project")?.as_str().map(PathBuf::from)
+    let project = PathBuf::from(record.get("project")?.as_str()?);
+    let set = Path::new(record.get("set")?.as_str()?)
+        .canonicalize()
+        .ok()?;
+    let place = dir.canonicalize().ok()?;
+    Some(project.join(place.strip_prefix(set).ok()?))
 }
 
 /// Nearest directory holding a config file: where `--local` plugins go.
@@ -343,11 +357,10 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
     let worktrees = match config.worktrees_dir.as_deref() {
         Some(dir) => relative_dir(base_dir, dir)
             .or_else(|why| {
-                // A set's checkout carries its workspace's config, whose
-                // absolute worktrees_dir is inside the workspace the set
-                // was made from
-                match set_origin(base_dir) {
-                    Some(origin) if Path::new(dir).is_absolute() => relative_dir(&origin, dir),
+                // A set's checkout carries the config of the checkout it
+                // stands for, whose absolute worktrees_dir is inside that one
+                match set_source(base_dir) {
+                    Some(source) if Path::new(dir).is_absolute() => relative_dir(&source, dir),
                     _ => Err(why),
                 }
             })
@@ -2263,7 +2276,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worktree_meta_made_belongs_to_its_origins_workspace() {
+    fn a_worktree_meta_made_belongs_to_its_sources_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
         meta_json(&top, r#""a": "x""#);
@@ -2277,13 +2290,13 @@ mod tests {
         // Made by hand: a workspace of its own
         assert_eq!(workspace_meta_dirs(&set), vec![set.clone()]);
         // Made by meta
-        let record = serde_json::json!({ "project": top });
+        let record = serde_json::json!({ "project": top, "set": set });
         std::fs::write(admin.join(WORKTREE_RECORD_FILE), record.to_string()).unwrap();
         assert_eq!(workspace_meta_dirs(&set), vec![set.clone(), top.clone()]);
     }
 
     #[test]
-    fn a_nested_checkout_in_a_set_climbs_the_set_then_its_origin() {
+    fn a_nested_checkout_in_a_set_climbs_the_set_then_its_source() {
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
         let listing_child = r#""child": {"repo": "x", "meta": true}"#;
@@ -2293,7 +2306,7 @@ mod tests {
         let set = top.join(".worktrees/ctx");
         meta_json(&set, listing_child);
         meta_json(&set.join("child"), "");
-        let record = serde_json::json!({ "project": top }).to_string();
+        let record = serde_json::json!({ "project": top, "set": set }).to_string();
         for (checkout, id) in [(&set, "ctx"), (&set.join("child"), "child")] {
             let admin = top.join(".git/worktrees").join(id);
             std::fs::create_dir_all(&admin).unwrap();
@@ -2304,9 +2317,15 @@ mod tests {
             )
             .unwrap();
         }
+        // The set's own meta dirs, then the checkout it stands for and up
         assert_eq!(
             workspace_meta_dirs(&set.join("child")),
-            vec![set.join("child"), set.clone(), top.clone()]
+            vec![
+                set.join("child"),
+                set.clone(),
+                top.join("child"),
+                top.clone()
+            ]
         );
     }
 
