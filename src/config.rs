@@ -204,24 +204,29 @@ pub fn find_meta_config(
     config_name: Option<&PathBuf>,
 ) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
     for dir in start_dir.ancestors() {
-        let found = if let Some(name) = config_name {
-            let path = dir.join(name);
-            if config_file_exists(&path)? {
-                std::fs::File::open(&path)
-                    .with_context(|| format!("Cannot read {}", escape_path(&path)))?;
-                let format = config_format(&path);
-                Some((path, format))
-            } else {
-                None
-            }
-        } else {
-            find_meta_config_in(dir)?
-        };
+        let found = meta_config_at(dir, config_name)?;
         if found.is_some() {
             return Ok(found);
         }
     }
     Ok(None)
+}
+
+/// The config in `dir` itself: `config_name` if given, else the default.
+pub fn meta_config_at(
+    dir: &Path,
+    config_name: Option<&PathBuf>,
+) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+    let Some(name) = config_name else {
+        return find_meta_config_in(dir);
+    };
+    let path = dir.join(name);
+    if !config_file_exists(&path)? {
+        return Ok(None);
+    }
+    std::fs::File::open(&path).with_context(|| format!("Cannot read {}", escape_path(&path)))?;
+    let format = config_format(&path);
+    Ok(Some((path, format)))
 }
 
 /// The meta directories of the workspace `meta_dir` belongs to, nearest
@@ -774,6 +779,12 @@ pub fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
             }
             Ok(meta) if meta.file_type().is_symlink() => match current.canonicalize() {
                 Ok(target) if target.starts_with(&base) => current = target,
+                // A link to what isn't there yet (a repo a checkout links
+                // to, before its own checkout): checked as the path it names
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    current = dangling_target(&base, &current, rel)?;
+                    exists = false;
+                }
                 Ok(_) => {
                     return Err(format!(
                         "path '{rel}' leads outside {} through the symlink '{}'",
@@ -799,6 +810,43 @@ pub fn resolve_inside(base_dir: &Path, rel: &str) -> Result<PathBuf, String> {
         ));
     }
     Ok(current)
+}
+
+/// Where the symlink `link` inside `base` leads when its target is missing:
+/// the target's path, itself checked with [`resolve_inside`].
+fn dangling_target(base: &Path, link: &Path, rel: &str) -> Result<PathBuf, String> {
+    let outside = || {
+        format!(
+            "path '{rel}' leads outside {} through the symlink '{}'",
+            escape_path(base),
+            escape_path(link)
+        )
+    };
+    let target = std::fs::read_link(link).map_err(|e| {
+        format!(
+            "path '{rel}' goes through the symlink '{}', which cannot be read: {e}",
+            escape_path(link)
+        )
+    })?;
+    let mut path = PathBuf::new();
+    for part in link.parent().unwrap_or(base).join(target).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                path.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => path.push(other),
+        }
+    }
+    let place = path.strip_prefix(base).map_err(|_| outside())?;
+    let place: Vec<_> = place
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    if place.is_empty() {
+        return Err(outside());
+    }
+    resolve_inside(base, &place.join("/"))
 }
 
 /// Load defaults from a meta config file.
@@ -1726,6 +1774,25 @@ mod tests {
             // The offending value is escaped in the message itself
             assert!(!err.contains('\u{1b}'), "{json}: {err}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_what_is_not_there_yet_leads_where_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink("real", base.join("link")).unwrap();
+        assert_eq!(resolve_inside(&base, "link"), Ok(base.join("real")));
+        assert_eq!(resolve_inside(&base, "link/x"), Ok(base.join("real/x")));
+
+        std::os::unix::fs::symlink("../elsewhere", base.join("out")).unwrap();
+        let err = resolve_inside(&base, "out").unwrap_err();
+        assert!(err.contains("leads outside"), "{err}");
+        // through a link that does exist, out of the base
+        std::os::unix::fs::symlink("/", base.join("root")).unwrap();
+        std::os::unix::fs::symlink("root/nowhere-meta-test", base.join("via")).unwrap();
+        let err = resolve_inside(&base, "via").unwrap_err();
+        assert!(err.contains("leads outside"), "{err}");
     }
 
     /// Whether a directory with mode 000 still can't be entered here (as
