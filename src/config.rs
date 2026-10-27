@@ -311,16 +311,32 @@ pub fn set_source(dir: &Path) -> Option<PathBuf> {
     Some(source)
 }
 
-/// One step of [`set_source`].
-fn recorded_source(dir: &Path) -> Option<PathBuf> {
+/// The meta directory meta's record says the set holding the checkout at
+/// `dir` was made from.
+pub fn recorded_project(dir: &Path) -> Option<PathBuf> {
+    let record = worktree_record(dir)?;
+    Some(PathBuf::from(record.get("project")?.as_str()?))
+}
+
+/// The set meta's record says the checkout at `dir` was made for, resolved.
+pub fn recorded_set(dir: &Path) -> Option<PathBuf> {
+    let record = worktree_record(dir)?;
+    Path::new(record.get("set")?.as_str()?).canonicalize().ok()
+}
+
+/// Meta's record of the linked worktree at `dir`, from git's admin directory
+/// for it (which its `.git` file names).
+fn worktree_record(dir: &Path) -> Option<serde_json::Value> {
     let gitfile = std::fs::read_to_string(dir.join(".git")).ok()?;
     let admin = dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim());
     let record = std::fs::read_to_string(admin.join(WORKTREE_RECORD_FILE)).ok()?;
-    let record: serde_json::Value = serde_json::from_str(&record).ok()?;
-    let project = PathBuf::from(record.get("project")?.as_str()?);
-    let set = Path::new(record.get("set")?.as_str()?)
-        .canonicalize()
-        .ok()?;
+    serde_json::from_str(&record).ok()
+}
+
+/// One step of [`set_source`].
+fn recorded_source(dir: &Path) -> Option<PathBuf> {
+    let project = recorded_project(dir)?;
+    let set = recorded_set(dir)?;
     let place = dir.canonicalize().ok()?;
     let place = place.strip_prefix(set).ok()?;
     // meta puts each repo of a set where it is in the workspace
