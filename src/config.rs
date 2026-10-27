@@ -291,15 +291,14 @@ fn lists(config: &Path, dir: &Path) -> bool {
 pub const WORKTREE_RECORD_FILE: &str = "meta-worktree.json";
 
 /// The checkout that `dir`, a checkout in a worktree set meta made, stands
-/// for. Meta's record in the checkout's git admin directory
-/// (`<repo>/.git/worktrees/<id>/`, which its `.git` file names) gives the
-/// `project` the set was made from; the checkout's place in the set is the
-/// alias it was created under: a project name, whose path the project's
-/// config gives, or (with --recursive) the path itself. A set
-/// made from inside another set leads on to that set's source. A worktree
-/// made by hand has no record and stands for itself, as a second workspace
-/// can. Git's shared repository doesn't say which checkout made a set, so
-/// only the record is used.
+/// for: the `project` the set was made from, joined with `dir`'s place in
+/// the set (meta lays a set out as the workspace). The project comes from
+/// meta's record in the checkout's git admin directory
+/// (`<repo>/.git/worktrees/<id>/`, which its `.git` file names). A set made
+/// from inside another set leads on to that set's source. A worktree made by
+/// hand has no record and stands for itself, as a second workspace can.
+/// Git's shared repository doesn't say which checkout made a set, so only
+/// the record is used.
 pub fn set_source(dir: &Path) -> Option<PathBuf> {
     let mut source = recorded_source(dir)?;
     let mut seen = vec![dir.to_path_buf()];
@@ -324,19 +323,8 @@ fn recorded_source(dir: &Path) -> Option<PathBuf> {
         .ok()?;
     let place = dir.canonicalize().ok()?;
     let place = place.strip_prefix(set).ok()?;
-    if place.as_os_str().is_empty() {
-        return Some(project);
-    }
-    // A set made without --recursive names a member by its project name;
-    // with it, by its path from the root, which is where it already is
-    let alias = place.to_string_lossy();
-    let named = find_meta_config_in(&project)
-        .ok()
-        .flatten()
-        .and_then(|(config, _)| parse_meta_config(&config).ok())
-        .and_then(|(projects, _)| projects.into_iter().find(|p| p.name == alias))
-        .map(|p| project.join(p.path));
-    Some(named.unwrap_or_else(|| project.join(place)))
+    // meta puts each repo of a set where it is in the workspace
+    Some(project.join(place))
 }
 
 /// Nearest directory holding a config file: where `--local` plugins go.
@@ -2356,6 +2344,31 @@ mod tests {
                 top.clone()
             ]
         );
+    }
+
+    #[test]
+    fn a_set_checkout_stands_for_the_repo_at_its_place() {
+        // alpha lives at beta, and beta at gamma: a checkout at <set>/beta is
+        // alpha's, not beta's
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        meta_json(
+            &top,
+            r#""alpha": {"repo": "x", "path": "beta"}, "beta": {"repo": "x", "path": "gamma"}"#,
+        );
+        let set = top.join(".worktrees/s");
+        let member = set.join("beta");
+        std::fs::create_dir_all(&member).unwrap();
+        let admin = top.join("beta/.git/worktrees/s");
+        std::fs::create_dir_all(&admin).unwrap();
+        let record = serde_json::json!({ "project": top, "set": set }).to_string();
+        std::fs::write(admin.join(WORKTREE_RECORD_FILE), record).unwrap();
+        std::fs::write(
+            member.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        assert_eq!(set_source(&member), Some(top.join("beta")));
     }
 
     #[test]
