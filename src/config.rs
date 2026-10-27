@@ -229,11 +229,11 @@ pub fn find_meta_config(
 /// whose own project list names the one before. A meta directory its parent
 /// doesn't list (or whose parent's config can't be read) is a workspace of
 /// its own. A checkout in a worktree set meta made belongs to the workspace
-/// of the main checkout it was made from, which follows it in the list.
+/// the set was made from ([`set_origin`]), which follows it in the list.
 pub fn workspace_meta_dirs(meta_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![meta_dir.to_path_buf()];
-    let start = match main_checkout(meta_dir)
-        .filter(|main| matches!(find_meta_config_in(main), Ok(Some(_))))
+    let start = match set_origin(meta_dir)
+        .filter(|origin| matches!(find_meta_config_in(origin), Ok(Some(_))))
     {
         Some(main) => {
             dirs.push(main.clone());
@@ -282,23 +282,18 @@ fn lists(config: &Path, dir: &Path) -> bool {
 /// made the worktree for.
 pub const WORKTREE_RECORD_FILE: &str = "meta-worktree.json";
 
-/// The main checkout of the linked git worktree at `dir`, if meta made it
-/// (its admin directory holds meta's record): its `.git` file names
-/// `<repo>/.git/worktrees/<id>`, whose `commondir` leads to `<repo>/.git`.
-/// A worktree made by hand is a checkout of its own, as a second workspace
-/// can be.
-pub fn main_checkout(dir: &Path) -> Option<PathBuf> {
+/// The meta directory a worktree set was made from, when `dir` is a checkout
+/// in a set meta made: the `project` in meta's record in the checkout's git
+/// admin directory (`<repo>/.git/worktrees/<id>/`, which its `.git` file
+/// names). A worktree made by hand has no record and is a checkout of its own,
+/// as a second workspace can be. Git's shared repository doesn't say which
+/// checkout made the set, so only the record is used.
+pub fn set_origin(dir: &Path) -> Option<PathBuf> {
     let gitfile = std::fs::read_to_string(dir.join(".git")).ok()?;
     let admin = dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim());
-    if !admin.join(WORKTREE_RECORD_FILE).is_file() {
-        return None;
-    }
-    let common = std::fs::read_to_string(admin.join("commondir")).ok()?;
-    let common = admin.join(common.trim()).canonicalize().ok()?;
-    if common.file_name()? != ".git" {
-        return None;
-    }
-    common.parent().map(Path::to_path_buf)
+    let record = std::fs::read_to_string(admin.join(WORKTREE_RECORD_FILE)).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&record).ok()?;
+    record.get("project")?.as_str().map(PathBuf::from)
 }
 
 /// Nearest directory holding a config file: where `--local` plugins go.
@@ -2258,7 +2253,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worktree_meta_made_belongs_to_its_main_checkouts_workspace() {
+    fn a_worktree_meta_made_belongs_to_its_origins_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
         meta_json(&top, r#""a": "x""#);
@@ -2272,7 +2267,8 @@ mod tests {
         // Made by hand: a workspace of its own
         assert_eq!(workspace_meta_dirs(&set), vec![set.clone()]);
         // Made by meta
-        std::fs::write(admin.join(WORKTREE_RECORD_FILE), "{}").unwrap();
+        let record = serde_json::json!({ "project": top });
+        std::fs::write(admin.join(WORKTREE_RECORD_FILE), record.to_string()).unwrap();
         assert_eq!(workspace_meta_dirs(&set), vec![set.clone(), top.clone()]);
     }
 
