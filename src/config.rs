@@ -291,13 +291,29 @@ fn lists(config: &Path, dir: &Path) -> bool {
 pub const WORKTREE_RECORD_FILE: &str = "meta-worktree.json";
 
 /// The checkout that `dir`, a checkout in a worktree set meta made, stands
-/// for: the `project` the set was made from joined with `dir`'s place in
-/// the set (`<project>/child` for `<set>/child`), from meta's record in the
-/// checkout's git admin directory (`<repo>/.git/worktrees/<id>/`, which its
-/// `.git` file names). A worktree made by hand has no record and stands for
-/// itself, as a second workspace can. Git's shared repository doesn't say
-/// which checkout made the set, so only the record is used.
+/// for. Meta's record in the checkout's git admin directory
+/// (`<repo>/.git/worktrees/<id>/`, which its `.git` file names) gives the
+/// `project` the set was made from; the checkout's place in the set is the
+/// alias it was created under: a project name, whose path the project's
+/// config gives, or (with --recursive) the path itself. A set
+/// made from inside another set leads on to that set's source. A worktree
+/// made by hand has no record and stands for itself, as a second workspace
+/// can. Git's shared repository doesn't say which checkout made a set, so
+/// only the record is used.
 pub fn set_source(dir: &Path) -> Option<PathBuf> {
+    let mut source = recorded_source(dir)?;
+    let mut seen = vec![dir.to_path_buf()];
+    while let Some(next) = recorded_source(&source) {
+        if seen.contains(&next) {
+            break;
+        }
+        seen.push(std::mem::replace(&mut source, next));
+    }
+    Some(source)
+}
+
+/// One step of [`set_source`].
+fn recorded_source(dir: &Path) -> Option<PathBuf> {
     let gitfile = std::fs::read_to_string(dir.join(".git")).ok()?;
     let admin = dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim());
     let record = std::fs::read_to_string(admin.join(WORKTREE_RECORD_FILE)).ok()?;
@@ -307,7 +323,20 @@ pub fn set_source(dir: &Path) -> Option<PathBuf> {
         .canonicalize()
         .ok()?;
     let place = dir.canonicalize().ok()?;
-    Some(project.join(place.strip_prefix(set).ok()?))
+    let place = place.strip_prefix(set).ok()?;
+    if place.as_os_str().is_empty() {
+        return Some(project);
+    }
+    // A set made without --recursive names a member by its project name;
+    // with it, by its path from the root, which is where it already is
+    let alias = place.to_string_lossy();
+    let named = find_meta_config_in(&project)
+        .ok()
+        .flatten()
+        .and_then(|(config, _)| parse_meta_config(&config).ok())
+        .and_then(|(projects, _)| projects.into_iter().find(|p| p.name == alias))
+        .map(|p| project.join(p.path));
+    Some(named.unwrap_or_else(|| project.join(place)))
 }
 
 /// Nearest directory holding a config file: where `--local` plugins go.
