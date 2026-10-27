@@ -86,7 +86,7 @@ pub struct MetaConfig {
     /// Projects in this meta repo. Values can be:
     /// - A git URL string: `"project": "git@github.com:org/repo.git"`
     /// - An extended object: `"project": { "repo": "...", "path": "...", "meta": true }`
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_projects")]
     pub projects: HashMap<String, ProjectEntry>,
     #[serde(default)]
     pub ignore: Vec<String>,
@@ -95,6 +95,38 @@ pub struct MetaConfig {
     /// Custom directory for worktrees (overrides default .worktrees/)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktrees_dir: Option<String>,
+}
+
+/// A project map in which no key appears twice: serde would keep the last.
+fn unique_projects<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<String, ProjectEntry>, D::Error> {
+    struct ProjectsVisitor;
+    impl<'de> serde::de::Visitor<'de> for ProjectsVisitor {
+        type Value = HashMap<String, ProjectEntry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of unique project keys")
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut projects = HashMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if projects.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate project key '{}'",
+                        escape(&key)
+                    )));
+                }
+                projects.insert(key, map.next_value()?);
+            }
+            Ok(projects)
+        }
+    }
+    deserializer.deserialize_map(ProjectsVisitor)
 }
 
 /// Determines the format of a config file based on extension
@@ -192,30 +224,65 @@ pub fn find_meta_config(
     Ok(None)
 }
 
-/// The root of the workspace `meta_dir` belongs to: `meta_dir`, or the
-/// nearest meta directory above it whose project tree lists it, and so on
-/// upward. A meta directory its parent doesn't list (or whose parent's tree
-/// can't be read) is a workspace of its own.
-pub fn workspace_root(meta_dir: &Path) -> PathBuf {
-    let mut root = meta_dir.to_path_buf();
-    for parent in meta_dir.ancestors().skip(1) {
+/// The meta directories of the workspace `meta_dir` belongs to, nearest
+/// first and its root last: `meta_dir`, then each meta directory above it
+/// whose own project list names the one before. A meta directory its parent
+/// doesn't list (or whose parent's config can't be read) is a workspace of
+/// its own. A linked git worktree, such as the root checkout of a worktree
+/// set, belongs to the workspace of its main checkout.
+pub fn workspace_meta_dirs(meta_dir: &Path) -> Vec<PathBuf> {
+    let start = main_checkout(meta_dir)
+        .filter(|main| matches!(find_meta_config_in(main), Ok(Some(_))))
+        .unwrap_or_else(|| meta_dir.to_path_buf());
+    let mut dirs = vec![start.clone()];
+    for parent in start.ancestors().skip(1) {
         match find_meta_config_in(parent) {
             Ok(None) => continue,
-            Ok(Some(_)) if lists(parent, &root) => root = parent.to_path_buf(),
+            Ok(Some((config, _))) if dirs.last().is_some_and(|dir| lists(&config, dir)) => {
+                dirs.push(parent.to_path_buf())
+            }
             _ => break,
         }
     }
-    root
+    dirs
 }
 
-/// Whether the project tree of the meta directory `parent` lists `dir`.
-fn lists(parent: &Path, dir: &Path) -> bool {
-    let (Ok(tree), Ok(dir)) = (walk_meta_tree(parent, None), dir.canonicalize()) else {
+/// The root of the workspace `meta_dir` belongs to (see [`workspace_meta_dirs`]).
+pub fn workspace_root(meta_dir: &Path) -> PathBuf {
+    workspace_meta_dirs(meta_dir)
+        .pop()
+        .unwrap_or_else(|| meta_dir.to_path_buf())
+}
+
+/// Whether the project list in `config` names the directory `dir`.
+fn lists(config: &Path, dir: &Path) -> bool {
+    let (Some(parent), Ok((projects, _)), Ok(dir)) = (
+        config.parent(),
+        parse_meta_config(config),
+        dir.canonicalize(),
+    ) else {
         return false;
     };
-    build_project_map(&tree, parent, "")
-        .into_values()
-        .any(|(path, _)| path.canonicalize().is_ok_and(|path| path == dir))
+    projects.iter().any(|p| {
+        parent
+            .join(&p.path)
+            .canonicalize()
+            .is_ok_and(|path| path == dir)
+    })
+}
+
+/// The main checkout of the linked git worktree at `dir`, if it is one: its
+/// `.git` file names `<repo>/.git/worktrees/<id>`, whose `commondir` leads to
+/// `<repo>/.git`.
+fn main_checkout(dir: &Path) -> Option<PathBuf> {
+    let gitfile = std::fs::read_to_string(dir.join(".git")).ok()?;
+    let admin = dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim());
+    let common = std::fs::read_to_string(admin.join("commondir")).ok()?;
+    let common = admin.join(common.trim()).canonicalize().ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    common.parent().map(Path::to_path_buf)
 }
 
 /// Nearest directory holding a config file: where `--local` plugins go.
@@ -238,48 +305,7 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
         )
     })?;
 
-    #[derive(Deserialize)]
-    struct CheckedConfig {
-        #[serde(default, deserialize_with = "unique_projects")]
-        projects: HashMap<String, ProjectEntry>,
-        #[serde(flatten)]
-        config: MetaConfig,
-    }
-
-    fn unique_projects<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<HashMap<String, ProjectEntry>, D::Error> {
-        struct ProjectsVisitor;
-        impl<'de> serde::de::Visitor<'de> for ProjectsVisitor {
-            type Value = HashMap<String, ProjectEntry>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a map of unique project keys")
-            }
-
-            fn visit_map<M: serde::de::MapAccess<'de>>(
-                self,
-                mut map: M,
-            ) -> Result<Self::Value, M::Error> {
-                let mut projects = HashMap::new();
-                while let Some(key) = map.next_key::<String>()? {
-                    if projects.contains_key(&key) {
-                        return Err(serde::de::Error::custom(format!(
-                            "duplicate project key '{}'",
-                            escape(&key)
-                        )));
-                    }
-                    projects.insert(key, map.next_value()?);
-                }
-                Ok(projects)
-            }
-        }
-        deserializer.deserialize_map(ProjectsVisitor)
-    }
-
-    // Determine format from file extension
-    let path_str = meta_path.to_string_lossy();
-    let checked: CheckedConfig = if path_str.ends_with(".yaml") || path_str.ends_with(".yml") {
+    let config: MetaConfig = if let ConfigFormat::Yaml = config_format(meta_path) {
         serde_yaml_ng::from_str(&config_str).with_context(|| {
             format!(
                 "Failed to parse YAML config file: {}",
@@ -294,9 +320,6 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
             )
         })?
     };
-
-    let mut config = checked.config;
-    config.projects = checked.projects;
 
     // Convert project entries to normalized, validated ProjectInfo
     // in name order, so the first bad entry reported is always the same one
@@ -724,8 +747,7 @@ pub fn load_meta_defaults(start_dir: &Path) -> MetaDefaults {
         Err(_) => return MetaDefaults::default(),
     };
 
-    let path_str = config_path.to_string_lossy();
-    let config: MetaConfig = if path_str.ends_with(".yaml") || path_str.ends_with(".yml") {
+    let config: MetaConfig = if let ConfigFormat::Yaml = config_format(&config_path) {
         serde_yaml_ng::from_str(&config_str).unwrap_or_default()
     } else {
         serde_json::from_str(&config_str).unwrap_or_default()
@@ -2217,6 +2239,38 @@ mod tests {
         let below = top.join("plain/sub");
         meta_json(&below, "");
         assert_eq!(workspace_root(&below), below);
+    }
+
+    #[test]
+    fn a_linked_worktree_belongs_to_its_main_checkouts_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        meta_json(&top, r#""a": "x""#);
+        // A worktree set's root checkout, as git lays it out
+        let admin = top.join(".git/worktrees/s1");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let set = top.join(".worktrees/s1");
+        meta_json(&set, r#""a": "x""#);
+        std::fs::write(set.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        assert_eq!(workspace_meta_dirs(&set), vec![top.clone()]);
+    }
+
+    #[test]
+    fn a_broken_sibling_config_does_not_split_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        meta_json(
+            &top,
+            r#""inner": {"repo": "x", "meta": true}, "other": {"repo": "x", "meta": true}"#,
+        );
+        meta_json(&top.join("inner"), "");
+        std::fs::create_dir_all(top.join("other")).unwrap();
+        std::fs::write(top.join("other/.meta.json"), "{not json").unwrap();
+        assert_eq!(
+            workspace_meta_dirs(&top.join("inner")),
+            vec![top.join("inner"), top.clone()]
+        );
     }
 
     #[test]
