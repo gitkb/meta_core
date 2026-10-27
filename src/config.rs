@@ -232,21 +232,21 @@ pub fn find_meta_config(
 /// the set was made from ([`set_origin`]), which follows it in the list.
 pub fn workspace_meta_dirs(meta_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![meta_dir.to_path_buf()];
-    let start = match set_origin(meta_dir)
-        .filter(|origin| matches!(find_meta_config_in(origin), Ok(Some(_))))
-    {
-        Some(main) => {
-            dirs.push(main.clone());
-            main
-        }
-        None => meta_dir.to_path_buf(),
-    };
-    for parent in start.ancestors().skip(1) {
-        match find_meta_config_in(parent) {
-            Ok(None) => continue,
-            Ok(Some((config, _))) if dirs.last().is_some_and(|dir| lists(&config, dir)) => {
-                dirs.push(parent.to_path_buf())
-            }
+    while let Some(dir) = dirs.last().cloned() {
+        let parent = dir
+            .ancestors()
+            .skip(1)
+            .find_map(|parent| match find_meta_config_in(parent) {
+                Ok(None) => None,
+                Ok(Some((config, _))) => Some(lists(&config, &dir).then(|| parent.to_path_buf())),
+                Err(_) => Some(None),
+            });
+        // Above the top of a set's checkouts, its origin's workspace goes on
+        let next = parent.flatten().or_else(|| {
+            set_origin(&dir).filter(|origin| matches!(find_meta_config_in(origin), Ok(Some(_))))
+        });
+        match next {
+            Some(next) if !dirs.contains(&next) => dirs.push(next),
             _ => break,
         }
     }
@@ -341,9 +341,19 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
     // Where worktrees live (as written, and where that really is); no
     // project may go there. A bad worktrees_dir is an error like a bad entry.
     let worktrees = match config.worktrees_dir.as_deref() {
-        Some(dir) => relative_dir(base_dir, dir).map_err(|why| {
-            anyhow::anyhow!("Invalid worktrees_dir in {}: {why}", escape_path(meta_path))
-        })?,
+        Some(dir) => relative_dir(base_dir, dir)
+            .or_else(|why| {
+                // A set's checkout carries its workspace's config, whose
+                // absolute worktrees_dir is inside the workspace the set
+                // was made from
+                match set_origin(base_dir) {
+                    Some(origin) if Path::new(dir).is_absolute() => relative_dir(&origin, dir),
+                    _ => Err(why),
+                }
+            })
+            .map_err(|why| {
+                anyhow::anyhow!("Invalid worktrees_dir in {}: {why}", escape_path(meta_path))
+            })?,
         None => ".worktrees".to_string(),
     };
     let worktrees_at = resolve_inside(base_dir, &worktrees)
@@ -2270,6 +2280,34 @@ mod tests {
         let record = serde_json::json!({ "project": top });
         std::fs::write(admin.join(WORKTREE_RECORD_FILE), record.to_string()).unwrap();
         assert_eq!(workspace_meta_dirs(&set), vec![set.clone(), top.clone()]);
+    }
+
+    #[test]
+    fn a_nested_checkout_in_a_set_climbs_the_set_then_its_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        let listing_child = r#""child": {"repo": "x", "meta": true}"#;
+        meta_json(&top, listing_child);
+        meta_json(&top.join("child"), "");
+        // The set's root and nested checkouts, each with meta's record
+        let set = top.join(".worktrees/ctx");
+        meta_json(&set, listing_child);
+        meta_json(&set.join("child"), "");
+        let record = serde_json::json!({ "project": top }).to_string();
+        for (checkout, id) in [(&set, "ctx"), (&set.join("child"), "child")] {
+            let admin = top.join(".git/worktrees").join(id);
+            std::fs::create_dir_all(&admin).unwrap();
+            std::fs::write(admin.join(WORKTREE_RECORD_FILE), &record).unwrap();
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", admin.display()),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            workspace_meta_dirs(&set.join("child")),
+            vec![set.join("child"), set.clone(), top.clone()]
+        );
     }
 
     #[test]
