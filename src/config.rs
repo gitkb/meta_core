@@ -902,21 +902,26 @@ fn dangling_target(base: &Path, link: &Path, rel: &str, hops: usize) -> Result<P
                 path.pop();
             }
             std::path::Component::CurDir => {}
-            other => {
-                path.push(other);
-                if path
-                    .symlink_metadata()
-                    .is_ok_and(|meta| meta.file_type().is_symlink())
-                {
-                    path = match path.canonicalize() {
-                        Ok(real) => real,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            dangling_target(base, &path, rel, hops + 1)?
+            // What exists is taken as the OS resolves it (links followed,
+            // and in the base's form: `\\?\` on Windows, which an absolute
+            // target doesn't carry); a link to what is missing is followed here
+            std::path::Component::Normal(_) => {
+                path.push(part);
+                match path.canonicalize() {
+                    Ok(real) => path = real,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if path
+                            .symlink_metadata()
+                            .is_ok_and(|meta| meta.file_type().is_symlink())
+                        {
+                            path = dangling_target(base, &path, rel, hops + 1)?;
                         }
-                        Err(e) => return Err(unresolved(&path, e)),
-                    };
+                    }
+                    Err(e) => return Err(unresolved(&path, e)),
                 }
             }
+            // The root of an absolute target
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => path.push(part),
         }
     }
     let outside = || {
@@ -1863,6 +1868,24 @@ mod tests {
             // The offending value is escaped in the message itself
             assert!(!err.contains('\u{1b}'), "{json}: {err}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_absolute_link_to_what_is_not_there_yet_stays_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        // the target as a user writes it, without `\\?\`
+        let plain = dir.path().join("real");
+        // creating links needs a privilege or developer mode
+        if std::os::windows::fs::symlink_dir(&plain, base.join("link")).is_err() {
+            return;
+        }
+        assert_eq!(resolve_inside(&base, "link"), Ok(base.join("real")));
+        let outside = tempfile::tempdir().unwrap();
+        std::os::windows::fs::symlink_dir(outside.path().join("x"), base.join("out")).unwrap();
+        let err = resolve_inside(&base, "out").unwrap_err();
+        assert!(err.contains("leads outside"), "{err}");
     }
 
     #[cfg(unix)]
