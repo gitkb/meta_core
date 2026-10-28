@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 /// Ensure the meta data directory exists, creating it if needed.
 /// Returns the path to the directory.
 pub fn ensure_meta_dir() -> Result<PathBuf> {
-    let dir = crate::meta_dir()?;
+    ensure_meta_dir_at(crate::meta_dir()?)
+}
+
+fn ensure_meta_dir_at(dir: PathBuf) -> Result<PathBuf> {
     create_private_dir(&dir)?;
     Ok(dir)
 }
@@ -25,7 +28,11 @@ pub fn ensure_meta_dir() -> Result<PathBuf> {
 /// The file may or may not exist. Use `store::read` to read with a default,
 /// or check existence manually.
 pub fn data_file(namespace: &str) -> Result<PathBuf> {
-    Ok(crate::meta_dir()?.join(format!("{namespace}.json")))
+    Ok(data_file_at(&crate::meta_dir()?, namespace))
+}
+
+fn data_file_at(dir: &Path, namespace: &str) -> PathBuf {
+    dir.join(format!("{namespace}.json"))
 }
 
 /// Get the path for a namespaced subdirectory: `~/.meta/<namespace>/`.
@@ -57,17 +64,14 @@ mod tests {
     #[test]
     fn test_data_file_path() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("META_DATA_DIR", tmp.path());
-        let path = data_file("worktree").unwrap();
+        let path = data_file_at(tmp.path(), "worktree");
         assert_eq!(path, tmp.path().join("worktree.json"));
-        std::env::remove_var("META_DATA_DIR");
     }
 
     #[test]
     fn test_ensure_meta_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("META_DATA_DIR", tmp.path().join("meta-test"));
-        let result = ensure_meta_dir().unwrap();
+        let result = ensure_meta_dir_at(tmp.path().join("meta-test")).unwrap();
         assert!(result.exists());
         #[cfg(unix)]
         {
@@ -75,6 +79,5 @@ mod tests {
             let mode = std::fs::metadata(&result).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700);
         }
-        std::env::remove_var("META_DATA_DIR");
     }
 }
