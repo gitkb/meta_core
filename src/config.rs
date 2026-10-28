@@ -129,24 +129,27 @@ fn unique_projects<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_map(ProjectsVisitor)
 }
 
-/// Supported config filenames. Exactly one may be a file in a directory.
-pub const META_CONFIG_NAMES: [&str; 2] = [".meta.yaml", ".meta.yml"];
+/// The config filename meta looks for.
+pub const META_CONFIG_NAME: &str = ".meta.yaml";
 
-fn config_file_exists(path: &Path) -> anyhow::Result<bool> {
-    let unreadable = |e| anyhow::anyhow!("Cannot read {}: {e}", escape_path(path));
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+/// `path` if it is a file; one that can't be examined or read is an error.
+fn config_file(path: PathBuf) -> anyhow::Result<Option<PathBuf>> {
+    let unreadable = |e| anyhow::anyhow!("Cannot read {}: {e}", escape_path(&path));
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(unreadable(e)),
         Ok(_) => {}
     }
-    std::fs::metadata(path)
-        .map(|meta| meta.is_file())
-        .map_err(unreadable)
+    if !std::fs::metadata(&path).map_err(unreadable)?.is_file() {
+        return Ok(None);
+    }
+    std::fs::File::open(&path).with_context(|| format!("Cannot read {}", escape_path(&path)))?;
+    Ok(Some(path))
 }
 
-/// Find the config directly in `dir`, using [`META_CONFIG_NAMES`].
-/// Multiple config files or a candidate that cannot be examined are errors.
-/// A `.meta` directory (for plugins and skills) is never a config.
+/// The [`META_CONFIG_NAME`] file directly in `dir`. A candidate that cannot
+/// be examined is an error. A `.meta` directory (for plugins and skills) is
+/// never a config.
 pub fn find_meta_config_in(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
@@ -154,35 +157,11 @@ pub fn find_meta_config_in(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("Cannot read {}", escape_path(dir))),
     }
-    let mut found = Vec::new();
-    for name in META_CONFIG_NAMES {
-        let candidate = dir.join(name);
-        if config_file_exists(&candidate)? {
-            found.push(candidate);
-        }
-    }
-    if found.len() > 1 {
-        anyhow::bail!(
-            "Multiple meta config files in {}: {}. Keep exactly one config file.",
-            escape_path(dir),
-            found
-                .iter()
-                .map(|p| escape_path(p))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    if let Some(path) = found.pop() {
-        std::fs::File::open(&path)
-            .with_context(|| format!("Cannot read {}", escape_path(&path)))?;
-        Ok(Some(path))
-    } else {
-        Ok(None)
-    }
+    config_file(dir.join(META_CONFIG_NAME))
 }
 
 /// Find the nearest config, walking from `start_dir` to the filesystem root.
-/// Uses [`META_CONFIG_NAMES`], refusing ambiguous or unreadable configs.
+/// Uses [`META_CONFIG_NAME`], refusing unreadable configs.
 /// An explicit `config_name` selects only that filename instead.
 pub fn find_meta_config(
     start_dir: &Path,
@@ -205,12 +184,7 @@ pub fn meta_config_at(
     let Some(name) = config_name else {
         return find_meta_config_in(dir);
     };
-    let path = dir.join(name);
-    if !config_file_exists(&path)? {
-        return Ok(None);
-    }
-    std::fs::File::open(&path).with_context(|| format!("Cannot read {}", escape_path(&path)))?;
-    Ok(Some(path))
+    config_file(dir.join(name))
 }
 
 /// The meta directories of the workspace `meta_dir` belongs to, nearest
@@ -2405,42 +2379,6 @@ mod tests {
     // A `.meta/` directory (meta's local folder) is never config
     // ============================================================================
 
-    #[test]
-    fn config_discovery_rejects_all_ambiguous_names() {
-        let dir = tempfile::tempdir().unwrap();
-        let child = dir.path().join("child");
-        std::fs::create_dir(&child).unwrap();
-        for first in META_CONFIG_NAMES {
-            for second in META_CONFIG_NAMES {
-                if first >= second {
-                    continue;
-                }
-                let a = dir.path().join(first);
-                let b = dir.path().join(second);
-                std::fs::write(&a, "{}").unwrap();
-                std::fs::write(&b, "{}").unwrap();
-                for err in [
-                    find_meta_config_in(dir.path()).unwrap_err(),
-                    find_meta_config(&child, None).unwrap_err(),
-                ] {
-                    let message = err.to_string();
-                    assert!(message.contains("Multiple meta config files"));
-                    assert!(message.contains(&escape_path(&a)), "{message}");
-                    assert!(message.contains(&escape_path(&b)), "{message}");
-                }
-                std::fs::remove_file(a).unwrap();
-                std::fs::remove_file(b).unwrap();
-            }
-        }
-        for name in META_CONFIG_NAMES {
-            std::fs::write(dir.path().join(name), "{}").unwrap();
-        }
-        let message = find_meta_config_in(dir.path()).unwrap_err().to_string();
-        for name in META_CONFIG_NAMES {
-            assert!(message.contains(&escape_path(&dir.path().join(name))));
-        }
-    }
-
     fn meta_yaml(dir: &Path, projects: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
@@ -2703,7 +2641,7 @@ mod tests {
     #[test]
     fn old_config_names_are_not_config() {
         let dir = tempfile::tempdir().unwrap();
-        for name in [".meta", ".meta.json"] {
+        for name in [".meta", ".meta.json", ".meta.yml"] {
             std::fs::write(dir.path().join(name), r#"{"projects": {}}"#).unwrap();
         }
         assert!(find_meta_config(dir.path(), None).unwrap().is_none());
@@ -2748,15 +2686,10 @@ mod duplicate_project_tests {
     #[test]
     fn duplicate_project_keys_name_file_and_key() {
         let dir = tempfile::tempdir().unwrap();
-        for (file, content) in [
-            (".meta.yaml", "projects:\n  dup: first\n  dup: second\n"),
-            (".meta.yml", "projects:\n  dup: first\n  dup: second\n"),
-        ] {
-            let path = dir.path().join(file);
-            std::fs::write(&path, content).unwrap();
-            let err = format!("{:#}", super::parse_meta_config(&path).unwrap_err());
-            assert!(err.contains(file), "{err}");
-            assert!(err.contains("duplicate project key 'dup'"), "{err}");
-        }
+        let path = dir.path().join(".meta.yaml");
+        std::fs::write(&path, "projects:\n  dup: first\n  dup: second\n").unwrap();
+        let err = format!("{:#}", super::parse_meta_config(&path).unwrap_err());
+        assert!(err.contains(".meta.yaml"), "{err}");
+        assert!(err.contains("duplicate project key 'dup'"), "{err}");
     }
 }
