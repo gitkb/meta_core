@@ -1,7 +1,7 @@
-//! Shared configuration types and parsing for .meta files.
+//! Shared configuration types and parsing for meta config files.
 //!
 //! This module provides the core types and functions for finding and parsing
-//! .meta configuration files (JSON and YAML formats).
+//! meta's YAML configuration files.
 
 use crate::display::{escape, escape_path, is_unsafe_char};
 use anyhow::Context;
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Represents a project entry in the .meta config.
+/// Represents a project entry in the .meta.yaml.
 /// Can be either a simple git URL string or an extended object with additional fields.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -29,7 +29,7 @@ pub enum ProjectEntry {
         provides: Vec<String>,
         #[serde(default)]
         depends_on: Vec<String>,
-        /// If true, this directory contains a nested .meta config
+        /// If true, this directory contains a nested .meta.yaml
         #[serde(default)]
         meta: bool,
     },
@@ -50,7 +50,7 @@ pub struct ProjectInfo {
     /// What this project depends on (other project names or provided items)
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// If true, this directory contains a nested .meta config
+    /// If true, this directory contains a nested .meta.yaml
     #[serde(default)]
     pub meta: bool,
 }
@@ -62,7 +62,7 @@ impl ProjectInfo {
     }
 }
 
-/// Default settings that can be configured in .meta
+/// Default settings that can be configured in .meta.yaml
 #[derive(Debug, Deserialize, Clone)]
 pub struct MetaDefaults {
     /// Run commands in parallel by default (defaults to true)
@@ -129,22 +129,8 @@ fn unique_projects<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_map(ProjectsVisitor)
 }
 
-/// Determines the format of a config file based on extension
-#[derive(Debug, Clone)]
-pub enum ConfigFormat {
-    Json,
-    Yaml,
-}
-
 /// Supported config filenames. Exactly one may be a file in a directory.
-pub const META_CONFIG_NAMES: [&str; 4] = [".meta", ".meta.json", ".meta.yaml", ".meta.yml"];
-
-fn config_format(path: &Path) -> ConfigFormat {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("yaml" | "yml") => ConfigFormat::Yaml,
-        _ => ConfigFormat::Json,
-    }
-}
+pub const META_CONFIG_NAMES: [&str; 2] = [".meta.yaml", ".meta.yml"];
 
 fn config_file_exists(path: &Path) -> anyhow::Result<bool> {
     let unreadable = |e| anyhow::anyhow!("Cannot read {}: {e}", escape_path(path));
@@ -161,7 +147,7 @@ fn config_file_exists(path: &Path) -> anyhow::Result<bool> {
 /// Find the config directly in `dir`, using [`META_CONFIG_NAMES`].
 /// Multiple config files or a candidate that cannot be examined are errors.
 /// A `.meta` directory (for plugins and skills) is never a config.
-pub fn find_meta_config_in(dir: &Path) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+pub fn find_meta_config_in(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => return Ok(None),
@@ -189,8 +175,7 @@ pub fn find_meta_config_in(dir: &Path) -> anyhow::Result<Option<(PathBuf, Config
     if let Some(path) = found.pop() {
         std::fs::File::open(&path)
             .with_context(|| format!("Cannot read {}", escape_path(&path)))?;
-        let format = config_format(&path);
-        Ok(Some((path, format)))
+        Ok(Some(path))
     } else {
         Ok(None)
     }
@@ -202,7 +187,7 @@ pub fn find_meta_config_in(dir: &Path) -> anyhow::Result<Option<(PathBuf, Config
 pub fn find_meta_config(
     start_dir: &Path,
     config_name: Option<&PathBuf>,
-) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+) -> anyhow::Result<Option<PathBuf>> {
     for dir in start_dir.ancestors() {
         let found = meta_config_at(dir, config_name)?;
         if found.is_some() {
@@ -216,7 +201,7 @@ pub fn find_meta_config(
 pub fn meta_config_at(
     dir: &Path,
     config_name: Option<&PathBuf>,
-) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+) -> anyhow::Result<Option<PathBuf>> {
     let Some(name) = config_name else {
         return find_meta_config_in(dir);
     };
@@ -225,8 +210,7 @@ pub fn meta_config_at(
         return Ok(None);
     }
     std::fs::File::open(&path).with_context(|| format!("Cannot read {}", escape_path(&path)))?;
-    let format = config_format(&path);
-    Ok(Some((path, format)))
+    Ok(Some(path))
 }
 
 /// The meta directories of the workspace `meta_dir` belongs to, nearest
@@ -257,7 +241,7 @@ fn listed_chain(meta_dir: &Path) -> Vec<PathBuf> {
     for parent in meta_dir.ancestors().skip(1) {
         match find_meta_config_in(parent) {
             Ok(None) => continue,
-            Ok(Some((config, _))) if dirs.last().is_some_and(|dir| lists(&config, dir)) => {
+            Ok(Some(config)) if dirs.last().is_some_and(|dir| lists(&config, dir)) => {
                 dirs.push(parent.to_path_buf())
             }
             _ => break,
@@ -394,7 +378,7 @@ fn projects_with_git_dir(meta_dir: &Path, git_dir: &Path, depth: usize, found: &
     if depth > MAX_LINK_HOPS {
         return;
     }
-    let Some((config, _)) = find_meta_config_in(meta_dir).ok().flatten() else {
+    let Some(config) = find_meta_config_in(meta_dir).ok().flatten() else {
         return;
     };
     let Ok((projects, _)) = parse_meta_config(&config) else {
@@ -428,11 +412,10 @@ fn common_git_dir(dir: &Path) -> Option<PathBuf> {
 /// Nearest directory holding a config file: where `--local` plugins go.
 /// Plugin scope follows cwd, independently of a command's explicit `--config`.
 pub fn nearest_meta_dir(start_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
-    Ok(find_meta_config(start_dir, None)?
-        .and_then(|(path, _)| path.parent().map(Path::to_path_buf)))
+    Ok(find_meta_config(start_dir, None)?.and_then(|path| path.parent().map(Path::to_path_buf)))
 }
 
-/// Parse a meta config file (JSON or YAML) and return normalized project info and ignore list.
+/// Parse a meta config file (YAML) and return normalized project info and ignore list.
 ///
 /// Every project is checked by [`validate_project`] and no two projects may
 /// share or nest paths ([`check_no_overlap`]); a bad entry fails the parse
@@ -445,21 +428,12 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
         )
     })?;
 
-    let config: MetaConfig = if let ConfigFormat::Yaml = config_format(meta_path) {
-        serde_yaml_ng::from_str(&config_str).with_context(|| {
-            format!(
-                "Failed to parse YAML config file: {}",
-                escape_path(meta_path)
-            )
-        })?
-    } else {
-        serde_json::from_str(&config_str).with_context(|| {
-            format!(
-                "Failed to parse JSON config file: {}",
-                escape_path(meta_path)
-            )
-        })?
-    };
+    let config: MetaConfig = serde_yaml_ng::from_str(&config_str).with_context(|| {
+        format!(
+            "Failed to parse YAML config file: {}",
+            escape_path(meta_path)
+        )
+    })?;
 
     // Convert project entries to normalized, validated ProjectInfo
     // in name order, so the first bad entry reported is always the same one
@@ -498,7 +472,7 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
                     (Some(url), name.clone(), vec![], vec![], vec![], false)
                 }
                 // Extended object -> repo with additional fields
-                // meta: true indicates this project is also a meta-repo (has its own .meta)
+                // meta: true indicates this project is also a meta-repo (has its own .meta.yaml)
                 ProjectEntry::Extended {
                     repo,
                     path,
@@ -555,7 +529,7 @@ pub fn parse_meta_config(meta_path: &Path) -> anyhow::Result<(Vec<ProjectInfo>, 
 /// Check one project entry and normalize its path, or say what is wrong.
 ///
 /// These rules are checked once, when a config is parsed, so every caller can
-/// join `path` onto the directory of the `.meta` file without checking again:
+/// join `path` onto the directory of the `.meta.yaml` without checking again:
 /// - No value (name, path, repo, tags, provides, depends_on) is empty or holds
 ///   a control or bidirectional-control character ([`is_unsafe_char`]).
 /// - `name` is a relative path in normal form (usually one component; a
@@ -706,7 +680,7 @@ pub fn relative_dir(base_dir: &Path, raw: &str) -> Result<String, String> {
 /// a clone of the outer repo could check out a symlink that the inner path
 /// then follows out of the workspace. Locations are compared as resolved
 /// through existing symlinks, and without case, which some filesystems
-/// ignore. A repo inside another belongs in a nested `.meta` (`meta: true`).
+/// ignore. A repo inside another belongs in a nested `.meta.yaml` (`meta: true`).
 fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
     // Paths, by where they resolve; and names, which must name one project
     // each in commands
@@ -722,7 +696,7 @@ fn check_no_overlap(projects: &[(ProjectInfo, PathBuf)]) -> Result<(), String> {
     if let Some((outer, inner)) = nested(&by_location) {
         return Err(format!(
             "project '{}' (path '{}') is at or inside project '{}' (path '{}'); \
-             list it in a nested .meta instead",
+             list it in a nested .meta.yaml instead",
             escape(&inner.name),
             escape(&inner.path),
             escape(&outer.name),
@@ -759,7 +733,7 @@ fn nested<'a>(keyed: &[(PathBuf, &'a ProjectInfo)]) -> Option<(&'a ProjectInfo, 
 }
 
 /// What is wrong with a name or path component, if anything. The same
-/// `.meta` serves every platform, so each must name one and the same
+/// `.meta.yaml` serves every platform, so each must name one and the same
 /// directory everywhere:
 /// - only ASCII letters, digits, space and `._-+@`, which no filesystem
 ///   folds, normalizes or treats specially (Unicode names can alias each
@@ -819,7 +793,7 @@ fn normalize_project_path(raw: &str) -> Result<String, String> {
     }
     if parts.is_empty() {
         return Err(format!(
-            "path '{}' must name a directory below the .meta file",
+            "path '{}' must name a directory below the .meta.yaml file",
             escape(raw)
         ));
     }
@@ -898,7 +872,7 @@ fn resolve_inside_after(base_dir: &Path, rel: &str, hops: usize) -> Result<PathB
     }
     if current == base {
         return Err(format!(
-            "path '{}' leads to the directory of the .meta file itself",
+            "path '{}' leads to the directory of the .meta.yaml file itself",
             escape(rel)
         ));
     }
@@ -981,7 +955,7 @@ fn dangling_target(base: &Path, link: &Path, rel: &str, hops: usize) -> Result<P
 /// Load defaults from a meta config file.
 /// Returns MetaDefaults::default() if no config found or on parse error.
 pub fn load_meta_defaults(start_dir: &Path) -> MetaDefaults {
-    let Ok(Some((config_path, _format))) = find_meta_config_in(start_dir) else {
+    let Ok(Some(config_path)) = find_meta_config_in(start_dir) else {
         return MetaDefaults::default();
     };
 
@@ -990,13 +964,9 @@ pub fn load_meta_defaults(start_dir: &Path) -> MetaDefaults {
         Err(_) => return MetaDefaults::default(),
     };
 
-    let config: MetaConfig = if let ConfigFormat::Yaml = config_format(&config_path) {
-        serde_yaml_ng::from_str(&config_str).unwrap_or_default()
-    } else {
-        serde_json::from_str(&config_str).unwrap_or_default()
-    };
-
-    config.defaults
+    serde_yaml_ng::from_str::<MetaConfig>(&config_str)
+        .unwrap_or_default()
+        .defaults
 }
 
 // ============================================================================
@@ -1012,10 +982,10 @@ pub struct MetaTreeNode {
     pub children: Vec<MetaTreeNode>,
 }
 
-/// Walk a meta repository tree, discovering nested .meta repos.
+/// Walk a meta repository tree, discovering nested .meta.yaml repos.
 ///
-/// Parses the .meta config at `start_dir` and for each project checks
-/// if it has its own .meta file. Recursively expands children up to `max_depth`.
+/// Parses the .meta.yaml at `start_dir` and for each project checks
+/// if it has its own .meta.yaml file. Recursively expands children up to `max_depth`.
 /// Uses cycle detection via path canonicalization.
 ///
 /// `max_depth` of `None` means unlimited recursion.
@@ -1024,8 +994,8 @@ pub fn walk_meta_tree(
     start_dir: &Path,
     max_depth: Option<usize>,
 ) -> anyhow::Result<Vec<MetaTreeNode>> {
-    let (config_path, _format) = find_meta_config(start_dir, None)?
-        .ok_or_else(|| anyhow::anyhow!("No .meta config found in {}", escape_path(start_dir)))?;
+    let config_path = find_meta_config(start_dir, None)?
+        .ok_or_else(|| anyhow::anyhow!("No .meta.yaml found in {}", escape_path(start_dir)))?;
 
     let (projects, _ignore) = parse_meta_config(&config_path)?;
     let meta_dir = config_path.parent().unwrap_or(Path::new("."));
@@ -1106,24 +1076,22 @@ pub struct OrphanWarning {
     pub parent: PathBuf,
     /// Actual parent config path for the inclusion hint.
     pub parent_config: PathBuf,
-    /// Suggested key to add to parent's .meta file
+    /// Suggested key to add to the parent's config
     pub suggested_key: String,
-    /// Format of the parent's config file (for showing appropriate syntax)
-    pub parent_format: ConfigFormat,
 }
 
-/// Find a parent .meta config (if any) above the given meta directory.
+/// Find a parent .meta.yaml (if any) above the given meta directory.
 ///
 /// Starts searching from the parent of `meta_dir` and walks up.
-/// Returns None if this is the root meta repo (no parent .meta found).
-pub fn find_parent_meta_config(meta_dir: &Path) -> anyhow::Result<Option<(PathBuf, ConfigFormat)>> {
+/// Returns None if this is the root meta repo (no parent .meta.yaml found).
+pub fn find_parent_meta_config(meta_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     match meta_dir.parent() {
         Some(parent) => find_meta_config(parent, None),
         None => Ok(None),
     }
 }
 
-/// Find the root (topmost) meta directory by walking up through parent .meta configs.
+/// Find the root (topmost) meta directory by walking up through parent .meta.yaml files.
 ///
 /// Starting from `meta_dir`, repeatedly calls `find_parent_meta_config` until
 /// no more parents are found. Returns the topmost meta directory in the hierarchy.
@@ -1132,7 +1100,7 @@ pub fn find_root_meta_dir(meta_dir: &Path) -> anyhow::Result<PathBuf> {
     let mut current = meta_dir.to_path_buf();
     loop {
         match find_parent_meta_config(&current)? {
-            Some((parent_config_path, _format)) => {
+            Some(parent_config_path) => {
                 current = parent_config_path
                     .parent()
                     .ok_or_else(|| {
@@ -1150,11 +1118,11 @@ pub fn find_root_meta_dir(meta_dir: &Path) -> anyhow::Result<PathBuf> {
 
 /// Check if a meta directory is tracked by its parent meta config.
 ///
-/// Returns `Some(OrphanWarning)` if there's a parent .meta that doesn't include
+/// Returns `Some(OrphanWarning)` if there's a parent .meta.yaml that doesn't include
 /// this directory in its project list (directly or transitively).
 /// Returns `None` if tracked or if there's no parent meta.
 pub fn check_orphan_status(meta_dir: &Path) -> Option<OrphanWarning> {
-    let (parent_config, parent_format) = find_parent_meta_config(meta_dir).ok()??;
+    let parent_config = find_parent_meta_config(meta_dir).ok()??;
     let parent_meta_dir = parent_config.parent()?;
 
     // Walk the parent's project tree to see what's tracked
@@ -1186,7 +1154,6 @@ pub fn check_orphan_status(meta_dir: &Path) -> Option<OrphanWarning> {
             parent: parent_meta_dir.to_path_buf(),
             parent_config: parent_config.clone(),
             suggested_key,
-            parent_format,
         })
     }
 }
@@ -1203,7 +1170,7 @@ fn walk_inner(
     for project in projects {
         let project_dir = base_dir.join(&project.path);
 
-        // Check if this project has its own .meta file directly in its directory
+        // Check if this project has its own .meta.yaml file directly in its directory
         // Past the depth limit it is never read, so a config that can't be
         // examined only stops a walk that would recurse into it
         let nested_config = if current_depth < max_depth {
@@ -1217,7 +1184,7 @@ fn walk_inner(
         // A nested config that fails to parse or validate is an error, not an
         // empty subtree: skipping it would silently drop its repos.
         let mut children = vec![];
-        if let Some((nested_config_path, _)) = nested_config {
+        if let Some(nested_config_path) = nested_config {
             let canonical = project_dir.canonicalize().unwrap_or(project_dir.clone());
             // `visited` stops cycles through symlinks
             if current_depth < max_depth && visited.insert(canonical) {
@@ -1257,7 +1224,7 @@ mod tests {
     #[test]
     fn test_walk_meta_tree_empty_projects() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
+        std::fs::write(dir.path().join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
         let tree = walk_meta_tree(dir.path(), None).unwrap();
         assert!(tree.is_empty());
     }
@@ -1269,7 +1236,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("alpha")).unwrap();
         std::fs::create_dir(dir.path().join("middle")).unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {
                 "zebra": "git@github.com:org/zebra.git",
                 "alpha": "git@github.com:org/alpha.git",
@@ -1292,9 +1259,9 @@ mod tests {
         let no_meta = dir.path().join("no_meta");
         std::fs::create_dir(&has_meta).unwrap();
         std::fs::create_dir(&no_meta).unwrap();
-        std::fs::write(has_meta.join(".meta"), r#"{"projects": {}}"#).unwrap();
+        std::fs::write(has_meta.join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {
                 "has_meta": "git@github.com:org/has_meta.git",
                 "no_meta": "git@github.com:org/no_meta.git"
@@ -1316,12 +1283,12 @@ mod tests {
         let grandchild = child.join("grandchild");
         std::fs::create_dir_all(&grandchild).unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"child": "git@github.com:org/child.git"}}"#,
         )
         .unwrap();
         std::fs::write(
-            child.join(".meta"),
+            child.join(".meta.yaml"),
             r#"{"projects": {"grandchild": "git@github.com:org/grandchild.git"}}"#,
         )
         .unwrap();
@@ -1344,12 +1311,12 @@ mod tests {
         std::os::unix::fs::symlink(&child, child.join("loop")).unwrap();
 
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"child": "git@github.com:org/child.git"}}"#,
         )
         .unwrap();
         std::fs::write(
-            child.join(".meta"),
+            child.join(".meta.yaml"),
             r#"{"projects": {"loop": "git@github.com:org/loop.git"}}"#,
         )
         .unwrap();
@@ -1358,7 +1325,7 @@ mod tests {
         {
             let err = walk_meta_tree(dir.path(), None).unwrap_err().to_string();
             assert!(
-                err.contains("leads to the directory of the .meta file itself"),
+                err.contains("leads to the directory of the .meta.yaml file itself"),
                 "{err}"
             );
         }
@@ -1379,17 +1346,17 @@ mod tests {
         std::fs::create_dir_all(&l3).unwrap();
 
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"l1": "git@github.com:org/l1.git"}}"#,
         )
         .unwrap();
         std::fs::write(
-            l1.join(".meta"),
+            l1.join(".meta.yaml"),
             r#"{"projects": {"l2": "git@github.com:org/l2.git"}}"#,
         )
         .unwrap();
         std::fs::write(
-            l2.join(".meta"),
+            l2.join(".meta.yaml"),
             r#"{"projects": {"l3": "git@github.com:org/l3.git"}}"#,
         )
         .unwrap();
@@ -1406,9 +1373,9 @@ mod tests {
     #[test]
     fn test_walk_meta_tree_nonexistent_project_dir() {
         let dir = tempfile::tempdir().unwrap();
-        // Project listed in .meta but directory doesn't exist
+        // Project listed in .meta.yaml but directory doesn't exist
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"missing": "git@github.com:org/missing.git"}}"#,
         )
         .unwrap();
@@ -1426,7 +1393,7 @@ mod tests {
         let custom_path = dir.path().join("custom/path");
         std::fs::create_dir_all(&custom_path).unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {
                 "myproject": {
                     "repo": "git@github.com:org/myproject.git",
@@ -1455,7 +1422,7 @@ mod tests {
     #[test]
     fn test_load_meta_defaults_no_defaults_section() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
+        std::fs::write(dir.path().join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
         let defaults = load_meta_defaults(dir.path());
         // Defaults to parallel=true when defaults section is missing
         assert!(defaults.parallel);
@@ -1465,7 +1432,7 @@ mod tests {
     fn test_load_meta_defaults_parallel_true() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {}, "defaults": {"parallel": true}}"#,
         )
         .unwrap();
@@ -1477,7 +1444,7 @@ mod tests {
     fn test_load_meta_defaults_parallel_false() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {}, "defaults": {"parallel": false}}"#,
         )
         .unwrap();
@@ -1502,35 +1469,6 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_parse_nested_meta_json() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".meta"),
-            r#"{
-                "projects": {
-                    "core": "git@github.com:org/core.git",
-                    "vendor": { "repo": "git@github.com:org/vendor.git", "meta": true }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let (projects, _) = parse_meta_config(&dir.path().join(".meta")).unwrap();
-        assert_eq!(projects.len(), 2);
-
-        let vendor = projects.iter().find(|p| p.name == "vendor").unwrap();
-        assert_eq!(
-            vendor.repo.as_ref().unwrap(),
-            "git@github.com:org/vendor.git"
-        );
-        assert_eq!(vendor.path, "vendor");
-
-        let core = projects.iter().find(|p| p.name == "core").unwrap();
-        assert!(core.repo.is_some());
-        assert_eq!(core.repo.as_ref().unwrap(), "git@github.com:org/core.git");
-    }
-
-    #[test]
     fn test_parse_nested_meta_yaml() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1553,7 +1491,7 @@ mod tests {
     fn test_parse_nested_meta_with_custom_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{
                 "projects": {
                     "vendor": {
@@ -1566,7 +1504,7 @@ mod tests {
         )
         .unwrap();
 
-        let (projects, _) = parse_meta_config(&dir.path().join(".meta")).unwrap();
+        let (projects, _) = parse_meta_config(&dir.path().join(".meta.yaml")).unwrap();
         assert_eq!(projects.len(), 1);
 
         let vendor = &projects[0];
@@ -1610,16 +1548,16 @@ mod tests {
         let nested = vendor.join("tree-sitter-markdown");
         std::fs::create_dir_all(&nested).unwrap();
 
-        // Root .meta with nested meta project (has repo URL + meta: true)
+        // Root .meta.yaml with nested meta project (has repo URL + meta: true)
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"vendor": {"repo": "git@github.com:org/vendor.git", "meta": true}}}"#,
         )
         .unwrap();
 
-        // Nested .meta inside vendor (simulates what exists after cloning)
+        // Nested .meta.yaml inside vendor (simulates what exists after cloning)
         std::fs::write(
-            vendor.join(".meta"),
+            vendor.join(".meta.yaml"),
             r#"{"projects": {"tree-sitter-markdown": "git@github.com:org/tsm.git"}}"#,
         )
         .unwrap();
@@ -1648,7 +1586,7 @@ mod tests {
     #[test]
     fn test_find_parent_meta_config_none_at_root() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
+        std::fs::write(dir.path().join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
 
         // No parent above this directory
         let result = find_parent_meta_config(dir.path()).unwrap();
@@ -1661,15 +1599,15 @@ mod tests {
         let nested = dir.path().join("vendor");
         std::fs::create_dir(&nested).unwrap();
 
-        // Parent .meta
-        std::fs::write(dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
-        // Nested .meta
-        std::fs::write(nested.join(".meta"), r#"{"projects": {}}"#).unwrap();
+        // Parent .meta.yaml
+        std::fs::write(dir.path().join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
+        // Nested .meta.yaml
+        std::fs::write(nested.join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
 
         let result = find_parent_meta_config(&nested).unwrap();
         assert!(result.is_some());
-        let (path, _) = result.unwrap();
-        assert_eq!(path, dir.path().join(".meta"));
+        let path = result.unwrap();
+        assert_eq!(path, dir.path().join(".meta.yaml"));
     }
 
     #[test]
@@ -1678,14 +1616,14 @@ mod tests {
         let vendor = dir.path().join("vendor");
         std::fs::create_dir(&vendor).unwrap();
 
-        // Parent .meta tracks vendor with repo URL and meta: true
+        // Parent .meta.yaml tracks vendor with repo URL and meta: true
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"vendor": {"repo": "git@github.com:org/vendor.git", "meta": true}}}"#,
         )
         .unwrap();
-        // Nested .meta (simulates what exists after cloning vendor)
-        std::fs::write(vendor.join(".meta"), r#"{"projects": {}}"#).unwrap();
+        // Nested .meta.yaml (simulates what exists after cloning vendor)
+        std::fs::write(vendor.join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
 
         let result = check_orphan_status(&vendor);
         assert!(result.is_none(), "vendor should not be orphan when tracked");
@@ -1697,15 +1635,15 @@ mod tests {
         let vendor = dir.path().join("vendor");
         std::fs::create_dir(&vendor).unwrap();
 
-        // Parent .meta does NOT track vendor
+        // Parent .meta.yaml does NOT track vendor
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"other": "git@github.com:org/other.git"}}"#,
         )
         .unwrap();
         std::fs::create_dir(dir.path().join("other")).unwrap();
-        // Nested .meta
-        std::fs::write(vendor.join(".meta"), r#"{"projects": {}}"#).unwrap();
+        // Nested .meta.yaml
+        std::fs::write(vendor.join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
 
         let result = check_orphan_status(&vendor);
         assert!(result.is_some(), "vendor should be orphan when not tracked");
@@ -1719,9 +1657,9 @@ mod tests {
     #[test]
     fn test_check_orphan_status_no_parent_means_not_orphan() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
+        std::fs::write(dir.path().join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
 
-        // No parent .meta above this one
+        // No parent .meta.yaml above this one
         let result = check_orphan_status(dir.path());
         assert!(result.is_none(), "should not be orphan if no parent exists");
     }
@@ -1737,21 +1675,21 @@ mod tests {
 
         // Root tracks vendor as nested meta
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"vendor": {"repo": "git@github.com:org/vendor.git", "meta": true}}}"#,
         )
         .unwrap();
 
         // Vendor tracks sub-vendor as nested meta
         std::fs::write(
-            vendor.join(".meta"),
+            vendor.join(".meta.yaml"),
             r#"{"projects": {"sub-vendor": {"repo": "git@github.com:org/sub-vendor.git", "meta": true}}}"#,
         )
         .unwrap();
 
         // Sub-vendor tracks deep-lib
         std::fs::write(
-            sub_vendor.join(".meta"),
+            sub_vendor.join(".meta.yaml"),
             r#"{"projects": {"deep-lib": "git@github.com:org/deep-lib.git"}}"#,
         )
         .unwrap();
@@ -1775,21 +1713,21 @@ mod tests {
 
         // Root tracks vendor and backend
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"vendor": {"repo": "git@github.com:org/vendor.git", "meta": true}, "backend": "git@github.com:org/backend.git"}}"#,
         )
         .unwrap();
 
         // Vendor does NOT track orphan-project
         std::fs::write(
-            vendor.join(".meta"),
+            vendor.join(".meta.yaml"),
             r#"{"projects": {"lib": "git@github.com:org/lib.git"}}"#,
         )
         .unwrap();
         std::fs::create_dir(vendor.join("lib")).unwrap();
 
-        // Orphan has its own .meta
-        std::fs::write(orphan_dir.join(".meta"), r#"{"projects": {}}"#).unwrap();
+        // Orphan has its own .meta.yaml
+        std::fs::write(orphan_dir.join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
 
         // Check from orphan's perspective
         let result = check_orphan_status(&orphan_dir);
@@ -1805,17 +1743,17 @@ mod tests {
 
     #[test]
     fn test_walk_meta_tree_fails_on_malformed_nested_meta() {
-        // A broken nested .meta must surface, not silently drop its repos
+        // A broken nested .meta.yaml must surface, not silently drop its repos
         let dir = tempfile::tempdir().unwrap();
         let vendor = dir.path().join("vendor");
         std::fs::create_dir(&vendor).unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"vendor": {"repo": "git@github.com:org/vendor.git", "meta": true}}}"#,
         )
         .unwrap();
         std::fs::write(
-            vendor.join(".meta"),
+            vendor.join(".meta.yaml"),
             r#"{"projects": {"x": {"path": "../../escape"}}}"#,
         )
         .unwrap();
@@ -1826,8 +1764,8 @@ mod tests {
     }
 
     fn parse_err_in(dir: &Path, json: &str) -> String {
-        std::fs::write(dir.join(".meta"), json).unwrap();
-        parse_meta_config(&dir.join(".meta"))
+        std::fs::write(dir.join(".meta.yaml"), json).unwrap();
+        parse_meta_config(&dir.join(".meta.yaml"))
             .unwrap_err()
             .to_string()
     }
@@ -1853,7 +1791,7 @@ mod tests {
                 r#"{{"projects": {{"p": {{"repo": "u", "path": {path:?}}}}}}}"#
             ));
             assert!(err.contains("Invalid project 'p' in "), "{path}: {err}");
-            assert!(err.contains(".meta: path"), "{path}: {err}");
+            assert!(err.contains(".meta.yaml: path"), "{path}: {err}");
         }
     }
 
@@ -2008,12 +1946,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_walk_fails_on_a_nested_config_it_cannot_read() {
-        // group/.meta links into a directory that can't be entered: the walk
+        // group/.meta.yaml links into a directory that can't be entered: the walk
         // must fail rather than leave group's repos out
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("group/core")).unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"group": {"repo": "u", "meta": true}}}"#,
         )
         .unwrap();
@@ -2024,8 +1962,11 @@ mod tests {
             r#"{"projects": {"core": "u"}}"#,
         )
         .unwrap();
-        std::os::unix::fs::symlink("../private/config.json", dir.path().join("group/.meta"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            "../private/config.json",
+            dir.path().join("group/.meta.yaml"),
+        )
+        .unwrap();
         assert!(walk_meta_tree(dir.path(), None).is_ok());
         if !locked_dir(&private) {
             return;
@@ -2034,7 +1975,7 @@ mod tests {
         unlock_dir(&private);
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("Cannot read") && err.contains(".meta"),
+            err.contains("Cannot read") && err.contains(".meta.yaml"),
             "{err}"
         );
     }
@@ -2048,11 +1989,11 @@ mod tests {
         std::fs::create_dir(dir.path().join("real")).unwrap();
         std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("alias")).unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"outer": {"repo": "u", "path": "real/outer"}, "inner": {"repo": "u", "path": "alias/outer/link/x"}}}"#,
         )
         .unwrap();
-        let err = parse_meta_config(&dir.path().join(".meta"))
+        let err = parse_meta_config(&dir.path().join(".meta.yaml"))
             .unwrap_err()
             .to_string();
         assert!(
@@ -2083,7 +2024,7 @@ mod tests {
         // config's own directory is refused
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(dir.path(), dir.path().join("here")).unwrap();
-        let meta = dir.path().join(".meta");
+        let meta = dir.path().join(".meta.yaml");
         std::fs::write(
             &meta,
             r#"{"projects": {"svc": {"repo": "u", "path": "here/service"}}}"#,
@@ -2098,7 +2039,7 @@ mod tests {
         .unwrap();
         let err = parse_meta_config(&meta).unwrap_err().to_string();
         assert!(
-            err.contains("leads to the directory of the .meta file itself"),
+            err.contains("leads to the directory of the .meta.yaml file itself"),
             "{err}"
         );
     }
@@ -2109,8 +2050,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws\nfake line\u{1b}[2J");
         std::fs::create_dir(&ws).unwrap();
-        std::fs::write(ws.join(".meta"), "{not json").unwrap();
-        let err = format!("{:#}", parse_meta_config(&ws.join(".meta")).unwrap_err());
+        std::fs::write(ws.join(".meta.yaml"), "{not json").unwrap();
+        let err = format!(
+            "{:#}",
+            parse_meta_config(&ws.join(".meta.yaml")).unwrap_err()
+        );
         assert!(!err.contains('\n') && !err.contains('\u{1b}'), "{err}");
         assert!(err.contains("ws\\nfake line\\u{1b}[2J"), "{err}");
     }
@@ -2206,11 +2150,11 @@ mod tests {
         // Ordinary names that only look similar are fine
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"console": "u", "a.b": "u", "com10": "u", "x y+z@w": "u", ".github": "u"}}"#,
         )
         .unwrap();
-        assert!(parse_meta_config(&dir.path().join(".meta")).is_ok());
+        assert!(parse_meta_config(&dir.path().join(".meta.yaml")).is_ok());
     }
 
     #[test]
@@ -2240,11 +2184,11 @@ mod tests {
         // A shared name prefix is not nesting
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"a": "u", "a-b": "u", "ab": {"repo": "u", "path": "a.b/c"}}}"#,
         )
         .unwrap();
-        assert!(parse_meta_config(&dir.path().join(".meta")).is_ok());
+        assert!(parse_meta_config(&dir.path().join(".meta.yaml")).is_ok());
     }
 
     #[test]
@@ -2332,11 +2276,11 @@ mod tests {
     fn test_parse_normalizes_paths() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"a": {"repo": "u", "path": "./third_party//vendor/"}, "b": {"repo": "u", "path": "x\\y"}}}"#,
         )
         .unwrap();
-        let (projects, _) = parse_meta_config(&dir.path().join(".meta")).unwrap();
+        let (projects, _) = parse_meta_config(&dir.path().join(".meta.yaml")).unwrap();
         assert_eq!(projects[0].path, "third_party/vendor");
         assert_eq!(projects[1].path, "x/y");
     }
@@ -2349,7 +2293,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
         std::fs::create_dir(dir.path().join("real")).unwrap();
         std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("inside")).unwrap();
-        let meta = dir.path().join(".meta");
+        let meta = dir.path().join(".meta.yaml");
 
         for path in ["link", "link/sub"] {
             std::fs::write(
@@ -2386,7 +2330,7 @@ mod tests {
         std::fs::create_dir_all(&custom_path).unwrap();
 
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"my-project": {"repo": "git@github.com:org/my-project.git", "path": "custom/path/to/project"}}}"#,
         )
         .unwrap();
@@ -2401,30 +2345,6 @@ mod tests {
         assert_eq!(*path, custom_path);
     }
 
-    #[test]
-    fn test_check_orphan_status_yaml_format() {
-        let dir = tempfile::tempdir().unwrap();
-        let vendor = dir.path().join("vendor");
-        std::fs::create_dir(&vendor).unwrap();
-
-        // Parent .meta.yaml does NOT track vendor
-        std::fs::write(
-            dir.path().join(".meta.yaml"),
-            "projects:\n  other:\n    repo: git@github.com:org/other.git\n",
-        )
-        .unwrap();
-        std::fs::create_dir(dir.path().join("other")).unwrap();
-
-        // Nested .meta (JSON)
-        std::fs::write(vendor.join(".meta"), r#"{"projects": {}}"#).unwrap();
-
-        let result = check_orphan_status(&vendor);
-        assert!(result.is_some(), "vendor should be orphan when not tracked");
-
-        let warning = result.unwrap();
-        assert!(matches!(warning.parent_format, ConfigFormat::Yaml));
-    }
-
     // ============================================================================
     // find_root_meta_dir tests
     // ============================================================================
@@ -2433,7 +2353,7 @@ mod tests {
     fn test_find_root_meta_dir_no_parent() {
         // Single-level meta dir (no parent) → returns self
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".meta"), r#"{"projects": {}}"#).unwrap();
+        std::fs::write(dir.path().join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
 
         let root = find_root_meta_dir(dir.path()).unwrap();
         assert_eq!(root, dir.path());
@@ -2447,11 +2367,11 @@ mod tests {
         std::fs::create_dir(&child).unwrap();
 
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"child": {"repo": "git@github.com:org/child.git", "meta": true}}}"#,
         )
         .unwrap();
-        std::fs::write(child.join(".meta"), r#"{"projects": {}}"#).unwrap();
+        std::fs::write(child.join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
 
         let root = find_root_meta_dir(&child).unwrap();
         assert_eq!(root, dir.path());
@@ -2466,16 +2386,16 @@ mod tests {
         std::fs::create_dir_all(&grandchild).unwrap();
 
         std::fs::write(
-            dir.path().join(".meta"),
+            dir.path().join(".meta.yaml"),
             r#"{"projects": {"child": {"repo": "git@github.com:org/child.git", "meta": true}}}"#,
         )
         .unwrap();
         std::fs::write(
-            child.join(".meta"),
+            child.join(".meta.yaml"),
             r#"{"projects": {"grandchild": {"repo": "git@github.com:org/gc.git", "meta": true}}}"#,
         )
         .unwrap();
-        std::fs::write(grandchild.join(".meta"), r#"{"projects": {}}"#).unwrap();
+        std::fs::write(grandchild.join(".meta.yaml"), r#"{"projects": {}}"#).unwrap();
 
         let root = find_root_meta_dir(&grandchild).unwrap();
         assert_eq!(root, dir.path());
@@ -2521,10 +2441,10 @@ mod tests {
         }
     }
 
-    fn meta_json(dir: &Path, projects: &str) {
+    fn meta_yaml(dir: &Path, projects: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
-            dir.join(".meta.json"),
+            dir.join(".meta.yaml"),
             format!(r#"{{"projects": {{{projects}}}}}"#),
         )
         .unwrap();
@@ -2534,19 +2454,19 @@ mod tests {
     fn the_root_climbs_only_through_parents_that_list_the_child() {
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
-        meta_json(&top, r#""inner": {"repo": "x", "meta": true}"#);
-        meta_json(&top.join("inner"), r#""deep": {"repo": "x", "meta": true}"#);
-        meta_json(&top.join("inner/deep"), "");
+        meta_yaml(&top, r#""inner": {"repo": "x", "meta": true}"#);
+        meta_yaml(&top.join("inner"), r#""deep": {"repo": "x", "meta": true}"#);
+        meta_yaml(&top.join("inner/deep"), "");
         assert_eq!(workspace_root(&top.join("inner/deep")), top);
         assert_eq!(workspace_root(&top.join("inner")), top);
 
         // A workspace inside another that doesn't list it is its own
         let unlisted = top.join("inner/elsewhere");
-        meta_json(&unlisted, "");
+        meta_yaml(&unlisted, "");
         assert_eq!(workspace_root(&unlisted), unlisted);
         // and so is one under a directory without a config
         let below = top.join("plain/sub");
-        meta_json(&below, "");
+        meta_yaml(&below, "");
         assert_eq!(workspace_root(&below), below);
     }
 
@@ -2554,13 +2474,13 @@ mod tests {
     fn a_worktree_meta_made_belongs_to_its_sources_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
-        meta_json(&top, r#""a": "x""#);
+        meta_yaml(&top, r#""a": "x""#);
         // A worktree set's root checkout, as git lays it out
         let admin = top.join(".git/worktrees/s1");
         std::fs::create_dir_all(&admin).unwrap();
         std::fs::write(admin.join("commondir"), "../..\n").unwrap();
         let set = top.join(".worktrees/s1");
-        meta_json(&set, r#""a": "x""#);
+        meta_yaml(&set, r#""a": "x""#);
         std::fs::write(set.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
         // Made by hand: a workspace of its own
         assert_eq!(workspace_meta_dirs(&set), vec![set.clone()]);
@@ -2575,12 +2495,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
         let listing_child = r#""child": {"repo": "x", "meta": true}"#;
-        meta_json(&top, listing_child);
-        meta_json(&top.join("child"), "");
+        meta_yaml(&top, listing_child);
+        meta_yaml(&top.join("child"), "");
         // The set's root and nested checkouts, each with meta's record
         let set = top.join(".worktrees/ctx");
-        meta_json(&set, listing_child);
-        meta_json(&set.join("child"), "");
+        meta_yaml(&set, listing_child);
+        meta_yaml(&set.join("child"), "");
         let record = serde_json::json!({ "project": top, "set": set }).to_string();
         for (checkout, repo) in [(&set, top.clone()), (&set.join("child"), top.join("child"))] {
             let admin = repo.join(".git/worktrees/ctx");
@@ -2611,7 +2531,7 @@ mod tests {
         // alpha's, not beta's
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
-        meta_json(
+        meta_yaml(
             &top,
             r#""alpha": {"repo": "x", "path": "beta"}, "beta": {"repo": "x", "path": "gamma"}"#,
         );
@@ -2637,7 +2557,7 @@ mod tests {
         // `alternate`, which in the workspace is another repository
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
-        meta_json(
+        meta_yaml(
             &top,
             r#""app": {"repo": "x", "path": "real"}, "alt": {"repo": "x", "path": "alternate"}"#,
         );
@@ -2664,16 +2584,16 @@ mod tests {
         assert_eq!(set_source(&member), Some(top.join("real")));
 
         // a broken config of another nested repo doesn't hide it
-        meta_json(
+        meta_yaml(
             &top,
             r#""app": {"repo": "x", "path": "real"}, "alt": {"repo": "x", "path": "alternate"}, "other": {"repo": "x", "meta": true}"#,
         );
         std::fs::create_dir_all(top.join("other")).unwrap();
-        std::fs::write(top.join("other/.meta.json"), "{broken").unwrap();
+        std::fs::write(top.join("other/.meta.yaml"), "{broken").unwrap();
         assert_eq!(set_source(&member), Some(top.join("real")));
 
         // a repository that is no project of the workspace stands for nothing
-        meta_json(&top, r#""alt": {"repo": "x", "path": "alternate"}"#);
+        meta_yaml(&top, r#""alt": {"repo": "x", "path": "alternate"}"#);
         assert_eq!(set_source(&member), None);
     }
 
@@ -2684,7 +2604,7 @@ mod tests {
         // checkout of app at `<set>/alternate`
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
-        meta_json(&top, r#""app": {"repo": "x", "path": "real"}"#);
+        meta_yaml(&top, r#""app": {"repo": "x", "path": "real"}"#);
         let linked = |checkout: &Path, id: &str| {
             let admin = top.join("real/.git/worktrees").join(id);
             std::fs::create_dir_all(&admin).unwrap();
@@ -2711,7 +2631,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap();
         let (top, git) = (base.join("ws"), base.join("git"));
-        meta_json(&top, "");
+        meta_yaml(&top, "");
         std::fs::write(top.join(".git"), format!("gitdir: {}\n", git.display())).unwrap();
         let set = top.join(".worktrees/s");
         std::fs::create_dir_all(&set).unwrap();
@@ -2737,13 +2657,13 @@ mod tests {
     fn a_broken_sibling_config_does_not_split_the_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
-        meta_json(
+        meta_yaml(
             &top,
             r#""inner": {"repo": "x", "meta": true}, "other": {"repo": "x", "meta": true}"#,
         );
-        meta_json(&top.join("inner"), "");
+        meta_yaml(&top.join("inner"), "");
         std::fs::create_dir_all(top.join("other")).unwrap();
-        std::fs::write(top.join("other/.meta.json"), "{not json").unwrap();
+        std::fs::write(top.join("other/.meta.yaml"), "{not json").unwrap();
         assert_eq!(
             workspace_meta_dirs(&top.join("inner")),
             vec![top.join("inner"), top.clone()]
@@ -2761,7 +2681,7 @@ mod tests {
             nearest_meta_dir(&cwd).unwrap(),
             Some(dir.path().to_path_buf())
         );
-        std::fs::write(inner.join(".meta.json"), "{}").unwrap();
+        std::fs::write(inner.join(".meta.yaml"), "{}").unwrap();
         assert_eq!(nearest_meta_dir(&cwd).unwrap(), Some(inner));
     }
 
@@ -2781,6 +2701,15 @@ mod tests {
     }
 
     #[test]
+    fn old_config_names_are_not_config() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [".meta", ".meta.json"] {
+            std::fs::write(dir.path().join(name), r#"{"projects": {}}"#).unwrap();
+        }
+        assert!(find_meta_config(dir.path(), None).unwrap().is_none());
+    }
+
+    #[test]
     fn test_meta_directory_is_not_config() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".meta/skills")).unwrap();
@@ -2788,12 +2717,9 @@ mod tests {
 
         std::fs::write(dir.path().join(".meta.yaml"), "projects: {}\n").unwrap();
         let expected = dir.path().join(".meta.yaml");
+        assert_eq!(find_meta_config_in(dir.path()).unwrap().unwrap(), expected);
         assert_eq!(
-            find_meta_config_in(dir.path()).unwrap().unwrap().0,
-            expected
-        );
-        assert_eq!(
-            find_meta_config(dir.path(), None).unwrap().unwrap().0,
+            find_meta_config(dir.path(), None).unwrap().unwrap(),
             expected
         );
     }
@@ -2803,11 +2729,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let child = dir.path().join("child");
         std::fs::create_dir_all(child.join(".meta")).unwrap();
-        // Legacy `.meta` config file in the parent
-        std::fs::write(dir.path().join(".meta"), r#"{"projects": {"child": "x"}}"#).unwrap();
+        std::fs::write(
+            dir.path().join(".meta.yaml"),
+            r#"{"projects": {"child": "x"}}"#,
+        )
+        .unwrap();
 
-        let (path, _) = find_meta_config(&child, None).unwrap().unwrap();
-        assert_eq!(path, dir.path().join(".meta"));
+        let path = find_meta_config(&child, None).unwrap().unwrap();
+        assert_eq!(path, dir.path().join(".meta.yaml"));
 
         let tree = walk_meta_tree(dir.path(), None).unwrap();
         assert!(!tree[0].is_meta);
@@ -2820,11 +2749,6 @@ mod duplicate_project_tests {
     fn duplicate_project_keys_name_file_and_key() {
         let dir = tempfile::tempdir().unwrap();
         for (file, content) in [
-            (".meta", r#"{"projects":{"dup":"first","dup":"second"}}"#),
-            (
-                ".meta.json",
-                r#"{"projects":{"dup":"first","dup":"second"}}"#,
-            ),
             (".meta.yaml", "projects:\n  dup: first\n  dup: second\n"),
             (".meta.yml", "projects:\n  dup: first\n  dup: second\n"),
         ] {

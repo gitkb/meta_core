@@ -1,6 +1,6 @@
 //! Escaping for untrusted text in human-readable output.
 //!
-//! Names, paths, tags and URLs come from `.meta` files, git and the filesystem.
+//! Names, paths, tags and URLs come from `.meta.yaml` files, git and the filesystem.
 //! Printed raw, a control character in one of them can move the cursor, clear
 //! the screen, set the window title or the clipboard, or break a line-based
 //! format such as the `meta context` table. Every human-readable printer
