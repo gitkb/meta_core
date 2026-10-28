@@ -359,35 +359,54 @@ fn recorded_source(dir: &Path) -> Option<PathBuf> {
     let place = place.strip_prefix(set).ok()?;
     // meta puts each repo of a set where it is in the workspace
     let source = project.join(place);
-    // unless a link that differs between the root's branches put it
-    // elsewhere: then that place holds another repository (or none), and the
-    // source is the project of the same workspace that is the checkout's own
-    // repository
-    match common_git_dir(dir) {
-        Some(own) if common_git_dir(&source).as_ref() != Some(&own) => {
-            project_with_git_dir(&project, &own, 0)
-        }
-        _ => Some(source),
+    // The set's root stands for the workspace itself. Another checkout
+    // stands for a project of that workspace with the same repository: the
+    // one at its place, else (a link that differs between the root's
+    // branches put it elsewhere) the only one there is. Its place alone
+    // doesn't say: a second workspace's `git worktree add` shares the
+    // repository but is no project.
+    let Some(own) = common_git_dir(dir) else {
+        return Some(source);
+    };
+    if place.as_os_str().is_empty() {
+        return Some(source);
+    }
+    let mut matches = Vec::new();
+    projects_with_git_dir(&project, &own, 0, &mut matches);
+    let at_place = source.canonicalize().ok();
+    match matches.as_slice() {
+        [only] => Some(only.clone()),
+        // no project says (one no longer listed, say): its place, if that
+        // is its repository
+        [] => (common_git_dir(&source).as_ref() == Some(&own)).then_some(source),
+        _ => matches.into_iter().find(|path| {
+            path.canonicalize()
+                .ok()
+                .is_some_and(|real| Some(real) == at_place)
+        }),
     }
 }
 
-/// The project of the meta repo at `meta_dir`, or of the meta repos nested
+/// The projects of the meta repo at `meta_dir`, and of the meta repos nested
 /// in it, whose repository's git directory is `git_dir`. A config that can't
-/// be read is passed over: one broken sibling doesn't hide the project.
-fn project_with_git_dir(meta_dir: &Path, git_dir: &Path, depth: usize) -> Option<PathBuf> {
+/// be read is passed over: one broken sibling doesn't hide a project.
+fn projects_with_git_dir(meta_dir: &Path, git_dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
     if depth > MAX_LINK_HOPS {
-        return None;
+        return;
     }
-    let (config, _) = find_meta_config_in(meta_dir).ok()??;
-    let (projects, _) = parse_meta_config(&config).ok()?;
-    projects.iter().find_map(|project| {
+    let Some((config, _)) = find_meta_config_in(meta_dir).ok().flatten() else {
+        return;
+    };
+    let Ok((projects, _)) = parse_meta_config(&config) else {
+        return;
+    };
+    for project in &projects {
         let path = meta_dir.join(&project.path);
         if common_git_dir(&path).as_deref() == Some(git_dir) {
-            Some(path)
-        } else {
-            project_with_git_dir(&path, git_dir, depth + 1)
+            found.push(path.clone());
         }
-    })
+        projects_with_git_dir(&path, git_dir, depth + 1, found);
+    }
 }
 
 /// The git directory the checkout at `dir` shares with its linked worktrees.
@@ -2656,6 +2675,35 @@ mod tests {
         // a repository that is no project of the workspace stands for nothing
         meta_json(&top, r#""alt": {"repo": "x", "path": "alternate"}"#);
         assert_eq!(set_source(&member), None);
+    }
+
+    #[test]
+    fn a_second_checkout_of_a_projects_repo_is_not_its_source() {
+        // app is at `real`; `alternate` is a hand-made `git worktree add` of
+        // the same repository, no project; a branch link put the set's
+        // checkout of app at `<set>/alternate`
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        meta_json(&top, r#""app": {"repo": "x", "path": "real"}"#);
+        let linked = |checkout: &Path, id: &str| {
+            let admin = top.join("real/.git/worktrees").join(id);
+            std::fs::create_dir_all(&admin).unwrap();
+            std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+            std::fs::create_dir_all(checkout).unwrap();
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", admin.display()),
+            )
+            .unwrap();
+            admin
+        };
+        linked(&top.join("alternate"), "alternate");
+        let set = top.join(".worktrees/s");
+        let member = set.join("alternate");
+        let admin = linked(&member, "s");
+        let record = serde_json::json!({ "project": top, "set": set }).to_string();
+        std::fs::write(admin.join(WORKTREE_RECORD_FILE), record).unwrap();
+        assert_eq!(set_source(&member), Some(top.join("real")));
     }
 
     #[test]
