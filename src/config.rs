@@ -2701,9 +2701,14 @@ mod duplicate_project_tests {
     fn duplicate_project_keys_name_file_and_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".meta.yaml");
-        std::fs::write(&path, "projects:\n  dup: first\n  dup: second\n").unwrap();
-        let err = format!("{:#}", super::parse_meta_config(&path).unwrap_err());
-        assert!(err.contains(".meta.yaml"), "{err}");
-        assert!(err.contains("duplicate project key 'dup'"), "{err}");
+        for content in [
+            "projects:\n  dup: first\n  dup: second\n",
+            r#"{"projects":{"dup":"first","dup":"second"}}"#,
+        ] {
+            std::fs::write(&path, content).unwrap();
+            let err = format!("{:#}", super::parse_meta_config(&path).unwrap_err());
+            assert!(err.contains(".meta.yaml"), "{err}");
+            assert!(err.contains("duplicate project key 'dup'"), "{err}");
+        }
     }
 }
