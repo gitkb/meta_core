@@ -341,12 +341,18 @@ pub fn has_worktree_record(dir: &Path) -> bool {
     record_path(dir).is_some_and(|path| path.symlink_metadata().is_ok())
 }
 
+/// The git directory the `.git` file of the checkout at `dir` names: for a
+/// linked worktree, git's admin directory for it. `None` when there is no
+/// such file or it names nothing.
+pub fn gitfile_target(dir: &Path) -> Option<PathBuf> {
+    let gitfile = std::fs::read_to_string(dir.join(".git")).ok()?;
+    Some(dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim()))
+}
+
 /// Where meta's record of the linked worktree at `dir` goes: in git's admin
 /// directory for it, which its `.git` file names.
 fn record_path(dir: &Path) -> Option<PathBuf> {
-    let gitfile = std::fs::read_to_string(dir.join(".git")).ok()?;
-    let admin = dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim());
-    Some(admin.join(WORKTREE_RECORD_FILE))
+    Some(gitfile_target(dir)?.join(WORKTREE_RECORD_FILE))
 }
 
 /// One step of [`set_source`].
@@ -1879,6 +1885,7 @@ mod tests {
         let plain = dir.path().join("real");
         // creating links needs a privilege or developer mode
         if std::os::windows::fs::symlink_dir(&plain, base.join("link")).is_err() {
+            eprintln!("skipped: this runner can't create symbolic links");
             return;
         }
         assert_eq!(resolve_inside(&base, "link"), Ok(base.join("real")));
