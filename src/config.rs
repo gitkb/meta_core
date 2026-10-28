@@ -332,10 +332,21 @@ pub fn recorded_set(dir: &Path) -> Option<PathBuf> {
 /// Meta's record of the linked worktree at `dir`, from git's admin directory
 /// for it (which its `.git` file names).
 fn worktree_record(dir: &Path) -> Option<serde_json::Value> {
+    let record = std::fs::read_to_string(record_path(dir)?).ok()?;
+    serde_json::from_str(&record).ok()
+}
+
+/// Whether meta left its record for the checkout at `dir`, readable or not.
+pub fn has_worktree_record(dir: &Path) -> bool {
+    record_path(dir).is_some_and(|path| path.symlink_metadata().is_ok())
+}
+
+/// Where meta's record of the linked worktree at `dir` goes: in git's admin
+/// directory for it, which its `.git` file names.
+fn record_path(dir: &Path) -> Option<PathBuf> {
     let gitfile = std::fs::read_to_string(dir.join(".git")).ok()?;
     let admin = dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim());
-    let record = std::fs::read_to_string(admin.join(WORKTREE_RECORD_FILE)).ok()?;
-    serde_json::from_str(&record).ok()
+    Some(admin.join(WORKTREE_RECORD_FILE))
 }
 
 /// One step of [`set_source`].
