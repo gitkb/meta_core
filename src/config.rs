@@ -345,7 +345,28 @@ fn recorded_source(dir: &Path) -> Option<PathBuf> {
     let place = dir.canonicalize().ok()?;
     let place = place.strip_prefix(set).ok()?;
     // meta puts each repo of a set where it is in the workspace
-    Some(project.join(place))
+    let source = project.join(place);
+    // unless a link that differs between the root's branches put it
+    // elsewhere: then that place holds another repository, and the source is
+    // git's main checkout of the checkout's own
+    match (common_git_dir(dir), common_git_dir(&source)) {
+        (Some(own), Some(there)) if own != there && own.file_name() == Some(".git".as_ref()) => {
+            own.parent().map(Path::to_path_buf)
+        }
+        _ => Some(source),
+    }
+}
+
+/// The git directory the checkout at `dir` shares with its linked worktrees.
+fn common_git_dir(dir: &Path) -> Option<PathBuf> {
+    let dot_git = dir.join(".git");
+    if dot_git.is_dir() {
+        return dot_git.canonicalize().ok();
+    }
+    let gitfile = std::fs::read_to_string(&dot_git).ok()?;
+    let admin = dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim());
+    let common = std::fs::read_to_string(admin.join("commondir")).ok()?;
+    admin.join(common.trim()).canonicalize().ok()
 }
 
 /// Nearest directory holding a config file: where `--local` plugins go.
@@ -2526,6 +2547,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(set_source(&member), Some(top.join("beta")));
+    }
+
+    #[test]
+    fn a_set_checkout_a_branch_link_put_elsewhere_stands_for_its_own_repo() {
+        // app is at `link`; the root's branch in the set links it to
+        // `alternate`, which in the workspace is another repository
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        let set = top.join(".worktrees/s");
+        let member = set.join("alternate");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::create_dir_all(top.join("alternate/.git")).unwrap();
+        let admin = top.join("real/.git/worktrees/s");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let record = serde_json::json!({ "project": top, "set": set }).to_string();
+        std::fs::write(admin.join(WORKTREE_RECORD_FILE), record).unwrap();
+        std::fs::write(
+            member.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        assert_eq!(set_source(&member), Some(top.join("real")));
     }
 
     #[test]
