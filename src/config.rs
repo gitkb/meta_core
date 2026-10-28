@@ -336,17 +336,13 @@ fn worktree_record(dir: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&record).ok()
 }
 
-/// Whether meta left its record for the checkout at `dir`, readable or not.
-pub fn has_worktree_record(dir: &Path) -> bool {
-    record_path(dir).is_some_and(|path| path.symlink_metadata().is_ok())
-}
-
 /// The git directory the `.git` file of the checkout at `dir` names: for a
 /// linked worktree, git's admin directory for it. `None` when there is no
-/// such file or it names nothing.
+/// such file or it names nothing (git rejects an empty `gitdir:` too).
 pub fn gitfile_target(dir: &Path) -> Option<PathBuf> {
     let gitfile = std::fs::read_to_string(dir.join(".git")).ok()?;
-    Some(dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim()))
+    let target = gitfile.trim().strip_prefix("gitdir:")?.trim();
+    (!target.is_empty()).then(|| dir.join(target))
 }
 
 /// Where meta's record of the linked worktree at `dir` goes: in git's admin
@@ -369,14 +365,29 @@ fn recorded_source(dir: &Path) -> Option<PathBuf> {
     // repository
     match common_git_dir(dir) {
         Some(own) if common_git_dir(&source).as_ref() != Some(&own) => {
-            let tree = walk_meta_tree(&project, None).ok()?;
-            build_project_map(&tree, &project, "")
-                .into_values()
-                .map(|(path, _)| path)
-                .find(|path| common_git_dir(path).as_ref() == Some(&own))
+            project_with_git_dir(&project, &own, 0)
         }
         _ => Some(source),
     }
+}
+
+/// The project of the meta repo at `meta_dir`, or of the meta repos nested
+/// in it, whose repository's git directory is `git_dir`. A config that can't
+/// be read is passed over: one broken sibling doesn't hide the project.
+fn project_with_git_dir(meta_dir: &Path, git_dir: &Path, depth: usize) -> Option<PathBuf> {
+    if depth > MAX_LINK_HOPS {
+        return None;
+    }
+    let (config, _) = find_meta_config_in(meta_dir).ok()??;
+    let (projects, _) = parse_meta_config(&config).ok()?;
+    projects.iter().find_map(|project| {
+        let path = meta_dir.join(&project.path);
+        if common_git_dir(&path).as_deref() == Some(git_dir) {
+            Some(path)
+        } else {
+            project_with_git_dir(&path, git_dir, depth + 1)
+        }
+    })
 }
 
 /// The git directory the checkout at `dir` shares with its linked worktrees.
@@ -385,8 +396,7 @@ fn common_git_dir(dir: &Path) -> Option<PathBuf> {
     if dot_git.is_dir() {
         return dot_git.canonicalize().ok();
     }
-    let gitfile = std::fs::read_to_string(&dot_git).ok()?;
-    let target = dir.join(gitfile.trim().strip_prefix("gitdir:")?.trim());
+    let target = gitfile_target(dir)?;
     // A linked worktree's admin directory names the git directory in
     // `commondir`; a `--separate-git-dir` checkout's `.git` names it itself
     match std::fs::read_to_string(target.join("commondir")) {
@@ -2634,6 +2644,15 @@ mod tests {
         std::fs::remove_dir_all(top.join("alternate")).unwrap();
         assert_eq!(set_source(&member), Some(top.join("real")));
 
+        // a broken config of another nested repo doesn't hide it
+        meta_json(
+            &top,
+            r#""app": {"repo": "x", "path": "real"}, "alt": {"repo": "x", "path": "alternate"}, "other": {"repo": "x", "meta": true}"#,
+        );
+        std::fs::create_dir_all(top.join("other")).unwrap();
+        std::fs::write(top.join("other/.meta.json"), "{broken").unwrap();
+        assert_eq!(set_source(&member), Some(top.join("real")));
+
         // a repository that is no project of the workspace stands for nothing
         meta_json(&top, r#""alt": {"repo": "x", "path": "alternate"}"#);
         assert_eq!(set_source(&member), None);
@@ -2655,6 +2674,15 @@ mod tests {
         std::fs::write(admin.join(WORKTREE_RECORD_FILE), record).unwrap();
         std::fs::write(set.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
         assert_eq!(set_source(&set), Some(top));
+    }
+
+    #[test]
+    fn an_empty_gitdir_names_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".git"), "gitdir:\n").unwrap();
+        assert_eq!(gitfile_target(tmp.path()), None);
+        std::fs::write(tmp.path().join(".git"), "gitdir: x\n").unwrap();
+        assert_eq!(gitfile_target(tmp.path()), Some(tmp.path().join("x")));
     }
 
     #[test]
