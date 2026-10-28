@@ -348,10 +348,14 @@ fn recorded_source(dir: &Path) -> Option<PathBuf> {
     let source = project.join(place);
     // unless a link that differs between the root's branches put it
     // elsewhere: then that place holds another repository, and the source is
-    // git's main checkout of the checkout's own
+    // the project of the same workspace that is the checkout's own repository
     match (common_git_dir(dir), common_git_dir(&source)) {
-        (Some(own), Some(there)) if own != there && own.file_name() == Some(".git".as_ref()) => {
-            own.parent().map(Path::to_path_buf)
+        (Some(own), Some(there)) if own != there => {
+            let tree = walk_meta_tree(&project, None).ok()?;
+            build_project_map(&tree, &project, "")
+                .into_values()
+                .map(|(path, _)| path)
+                .find(|path| common_git_dir(path).as_ref() == Some(&own))
         }
         _ => Some(source),
     }
@@ -2555,6 +2559,10 @@ mod tests {
         // `alternate`, which in the workspace is another repository
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().canonicalize().unwrap();
+        meta_json(
+            &top,
+            r#""app": {"repo": "x", "path": "real"}, "alt": {"repo": "x", "path": "alternate"}"#,
+        );
         let set = top.join(".worktrees/s");
         let member = set.join("alternate");
         std::fs::create_dir_all(&member).unwrap();
@@ -2570,6 +2578,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(set_source(&member), Some(top.join("real")));
+
+        // a repository that is no project of the workspace stands for nothing
+        meta_json(&top, r#""alt": {"repo": "x", "path": "alternate"}"#);
+        assert_eq!(set_source(&member), None);
     }
 
     #[test]
