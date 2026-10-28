@@ -2644,7 +2644,21 @@ mod tests {
         for name in [".meta", ".meta.json", ".meta.yml"] {
             std::fs::write(dir.path().join(name), r#"{"projects": {}}"#).unwrap();
         }
-        assert!(find_meta_config(dir.path(), None).unwrap().is_none());
+        assert!(find_meta_config_in(dir.path()).unwrap().is_none());
+        // Beside them `.meta.yaml` is the config, not one of several
+        let config = dir.path().join(".meta.yaml");
+        std::fs::write(&config, "projects: {}\n").unwrap();
+        assert_eq!(find_meta_config_in(dir.path()).unwrap(), Some(config));
+    }
+
+    #[test]
+    fn any_config_file_is_read_as_yaml() {
+        // whatever its name, as `--config alt.json` reads it
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alt.json");
+        std::fs::write(&path, "projects:\n  app: git@x:o/app.git\n").unwrap();
+        let (projects, _) = parse_meta_config(&path).unwrap();
+        assert_eq!(projects[0].name, "app");
     }
 
     #[test]
