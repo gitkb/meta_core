@@ -347,10 +347,11 @@ fn recorded_source(dir: &Path) -> Option<PathBuf> {
     // meta puts each repo of a set where it is in the workspace
     let source = project.join(place);
     // unless a link that differs between the root's branches put it
-    // elsewhere: then that place holds another repository, and the source is
-    // the project of the same workspace that is the checkout's own repository
-    match (common_git_dir(dir), common_git_dir(&source)) {
-        (Some(own), Some(there)) if own != there => {
+    // elsewhere: then that place holds another repository (or none), and the
+    // source is the project of the same workspace that is the checkout's own
+    // repository
+    match common_git_dir(dir) {
+        Some(own) if common_git_dir(&source).as_ref() != Some(&own) => {
             let tree = walk_meta_tree(&project, None).ok()?;
             build_project_map(&tree, &project, "")
                 .into_values()
@@ -2577,6 +2578,12 @@ mod tests {
             format!("gitdir: {}\n", admin.display()),
         )
         .unwrap();
+        assert_eq!(set_source(&member), Some(top.join("real")));
+
+        // so does a place that holds no repository, or nothing, in the workspace
+        std::fs::remove_dir_all(top.join("alternate/.git")).unwrap();
+        assert_eq!(set_source(&member), Some(top.join("real")));
+        std::fs::remove_dir_all(top.join("alternate")).unwrap();
         assert_eq!(set_source(&member), Some(top.join("real")));
 
         // a repository that is no project of the workspace stands for nothing
